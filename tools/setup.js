@@ -20,7 +20,7 @@ const ENGINE_DIR = path.join(ROOT, 'engine', 'build');
 const ENGINE_EXE = path.join(ENGINE_DIR, 'kiln-engine.exe');
 const CUDA_DIR = path.join(ROOT, 'third_party', 'cuda');
 const DL_DIR = path.join(ROOT, 'third_party', 'downloads');
-const DEFAULT_REPO = 'drewb583/kiln';
+const DEFAULT_REPO = 'sonsegajp/kiln';
 
 const args = new Set(process.argv.slice(2));
 const FORCE_BUILD = args.has('--build');

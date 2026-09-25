@@ -53,11 +53,11 @@ Nothing else needs to be installed beforehand: `setup.bat` fetches Node.js if yo
 1. **Get the code.** Either clone it:
 
    ```
-   git clone https://github.com/drewb583/kiln.git
+   git clone https://github.com/sonsegajp/kiln.git
    ```
 
    or, while the repository is private, use the GitHub CLI (`gh auth login` once, then
-   `gh repo clone drewb583/kiln`). You can also download the ZIP from the repository page and unpack it.
+   `gh repo clone sonsegajp/kiln`). You can also download the ZIP from the repository page and unpack it.
    Any folder works; paths with spaces are fine.
 
 2. **Run `setup.bat`** (double-click it, or run it from a terminal). It downloads, into the Kiln folder:
