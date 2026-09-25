@@ -1072,7 +1072,7 @@
     const bars = [];
     if (j.swap) {
       const ld = loadDone(j);
-      const what = p.family === 'sdxl' ? 'SDXL' : 'Anima';
+      const what = p.model ? String(p.model).split('/').pop().replace(/\.safetensors$/i, '') : p.family === 'sdxl' ? 'SDXL' : 'Anima';
       bars.push({ stage: 'load', label: `Load ${what}`, meta: j.load_ms != null ? fmtSec(j.load_ms) + ' s' : ld ? 'done' : j.loadProg != null ? `swap ${Math.round(j.loadProg * 100)}%` : 'swapping model…', frac: ld ? 1 : (j.loadProg || 0), state: ld ? 'done' : 'run', indet: !ld && !j.loadProg });
     }
     const eta = running && S.etaEnd ? ` · ${S.etaApprox ? '~' : ''}${fmtClock(S.etaEnd - Date.now())} left` : '';

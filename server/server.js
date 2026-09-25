@@ -189,6 +189,7 @@ engine.on('state', () => {
 });
 engine.on('exit', () => {
   engineFamily = 'anima';
+  engineDit = DEFAULT_DIT;
   if (running) {
     const j = running;
     running = null;
@@ -210,6 +211,10 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 let jobSeq = 0, groupSeq = 0;
 let engineFamily = 'anima';   // model family loaded in the engine (it starts with Anima)
+// Anima DiT loaded in the engine (it starts with the stock base model; null = unknown after a graph swapped it)
+const DEFAULT_DIT = path.join(MODELS, 'anima-base-v1.0.safetensors');
+let engineDit = DEFAULT_DIT;
+const sameFile = (a, b) => !!a && !!b && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const jobs = new Map();
 const queue = [];
 let running = null;
@@ -264,7 +269,7 @@ function validateRequest(b) {
     model = { file: c.file, family: fam, path: c.path };
   } else {
     const c = sdList.find(x => SF.inspect(x.path).family === 'anima');
-    if (c) model = { file: c.file, family: 'anima' };
+    if (c) model = { file: c.file, family: 'anima', path: c.path };
   }
   const loraMap = new Map(models.loras.map(l => [l.file, l]));
   const loras = [];
@@ -325,6 +330,8 @@ function validateRequest(b) {
     loras,
     batch: Math.round(num(b.batch ?? b.count ?? b.batch_count, 1, 1, 64)),
     model: model ? model.file : undefined,
+    // Anima: the DiT file the engine renders with (it swaps models when this changes)
+    ditPath: model && !sdxl ? model.path : undefined,
     // what gets tokenized: <lora:> tags removed, A1111 [de-emphasis] -> (text:0.9091)
     promptText: conv.text,
     negativeText: A.deemphasize(A.extractLoraTags(typeof b.negative === 'string' ? b.negative : '').text),
@@ -429,7 +436,7 @@ function createJobs(p) {
         scheduler: sdxl ? p.scheduler : undefined,
       },
       loraPaths: p.loras.map(l => ({ file: l.path, strength: l.strength })),
-      enc: qwen, neg, sd, family: sdxl ? 'sdxl' : 'anima', checkpoint: sdxl ? p.checkpointPath : null,
+      enc: qwen, neg, sd, family: sdxl ? 'sdxl' : 'anima', checkpoint: sdxl ? p.checkpointPath : null, dit: sdxl ? null : p.ditPath || null,
       step: 0, of: p.steps, stepMs: [], stage: 'base', timeline: [],
     };
     // post-processing options live in params (so they land in the PNG's kiln tEXt)
@@ -476,7 +483,11 @@ function pump() {
       j.ext = newExtSession(j);
     }
     if (!engine.send(req)) { if (j.ext) { j.ext.close(); j.ext = null; } running = null; j.status = 'queued'; queue.unshift(j); return; }
-    if (engineFamily !== 'anima' && Object.values(eg).some(n => n.class_type === 'UNETLoader')) { j.swap = true; engineFamily = 'anima'; }
+    if (Object.values(eg).some(n => n.class_type === 'UNETLoader')) {
+      if (engineFamily !== 'anima') j.swap = true;
+      engineFamily = 'anima';
+      engineDit = null;  // the graph picks its own DiT
+    }
     log(`job ${j.id} start graph: ${Object.keys(eg).length} nodes (${p.classes.join(', ')})${req.ext ? ' packs: ' + Object.keys(req.ext).join(', ') : ''} (${queue.length} queued)`);
     emitJob(j);
     emitFolded(j);
@@ -485,7 +496,7 @@ function pump() {
   }
   j.tmpOut = path.join(TMP, j.id + '_' + process.pid + '.rgb');
   // the first job of the other model family makes the engine swap models in VRAM (20-35 s)
-  const swap = j.family !== engineFamily;
+  const swap = j.family !== engineFamily || (j.family === 'anima' && !!j.dit && !sameFile(j.dit, engineDit));
   const req = j.family === 'sdxl' ? {
     id: j.id, cmd: 'generate', family: 'sdxl', checkpoint: j.checkpoint, sd: j.sd,
     width: p.width, height: p.height, steps: p.steps, cfg: p.cfg, seed: p.seed,
@@ -496,6 +507,7 @@ function pump() {
     width: p.width, height: p.height, steps: p.steps, cfg: p.cfg, seed: p.seed,
     sampler: p.sampler, shift: p.shift, loras: j.loraPaths, out: j.tmpOut, preview: true,
   };
+  if (j.family === 'anima' && j.dit) req.dit = j.dit;
   if (j.neg) req.neg = { qwen_ids: j.neg.qwen_ids, t5_ids: j.neg.t5_ids, t5_weights: j.neg.t5_weights };
   // only meaningful with a negative pass; absent = 1 (always) for older engine builds
   if (p.cfg > 1 && p.cfg_cutoff < 1) req.cfg_cutoff = p.cfg_cutoff;
@@ -511,6 +523,7 @@ function pump() {
     return;
   }
   j.swap = swap; engineFamily = j.family;
+  if (j.family === 'anima' && j.dit) engineDit = j.dit;
   const enh = [p.hires && `hires=${p.hires.scale}x/${p.hires.steps}st/${p.hires.upscaler}`, p.face && `face=${p.face.steps}st`, p.upscale && `upscale=${p.upscale.factor}x`].filter(Boolean).join(' ');
   log(`job ${j.id} start${j.family === 'sdxl' ? ' SDXL ' + path.basename(j.checkpoint) + (j.swap ? ' (model swap)' : '') + ' ' + p.scheduler : ''} ${p.width}x${p.height} steps=${p.steps} cfg=${p.cfg}${p.cfg > 1 && p.cfg_cutoff < 1 ? '@' + p.cfg_cutoff : ''} seed=${p.seed}${p.sampler !== 'euler' ? ' ' + p.sampler : ''}${p.step_cache > 0 ? ' cache=' + p.step_cache : ''}${req.nag ? ' nag=' + req.nag.scale : ''}${enh ? ' ' + enh : ''} (${queue.length} queued)`);
   emitJob(j);

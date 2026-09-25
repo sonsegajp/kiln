@@ -389,6 +389,7 @@ static Job parse_job(const Json& r) {
     Job j;
     j.family = r["family"].str("anima");
     j.checkpoint = r["checkpoint"].str();
+    j.dit = r["dit"].str();
     if (j.family == "sdxl") {
         j.sd_pos = parse_sd_tokens(r["sd"]["pos"]);
         j.sd_neg = parse_sd_tokens(r["sd"]["neg"]);

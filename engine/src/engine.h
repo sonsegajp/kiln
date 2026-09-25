@@ -179,6 +179,7 @@ struct Job {
     std::string id;
     std::string family = "anima";  // anima | sdxl
     std::string checkpoint;        // sdxl: the single-file checkpoint
+    std::string dit;               // anima: the DiT file to render with (empty = the default model)
     Cond pos, neg;                 // anima prompts
     SdTokens sd_pos, sd_neg;       // sdxl prompts
     std::string scheduler = "simple";
@@ -472,6 +473,7 @@ struct Engine {
         dit = Dit();
         size_t keep = G.reserve_bytes;
         G.reserve_bytes = (size_t)256 << 20;  // the arena already exists: only a small margin is needed
+        dit_path.clear();  // if the load fails, the next job loads again
         dit.load(path, Place::Auto);
         G.reserve_bytes = keep;
         dit_path = path;
@@ -665,12 +667,24 @@ struct Engine {
         if (getenv("KILN_POISON")) CK(cudaMemset(G.arena.base + m0, 0xFF, G.arena.cap - m0));  // NaN: exposes reads of unwritten scratch
         std::ostringstream tm;
         try {
+            // the checkpoint picked in the UI; the text encoder and VAE are shared by every Anima model
+            const std::string want = j.dit.empty() ? default_dit : j.dit;
+            if (family != "anima") dit_path = want;  // the family swap loads it directly
             use_family("anima");
+            int load_ms = -1;
+            if (_stricmp(want.c_str(), dit_path.c_str()) != 0) {
+                emit("{\"id\":" + json_escape(j.id) + ",\"ev\":\"loading\",\"what\":\"model\"}");
+                auto tr = Clock::now();
+                reload_dit(want);
+                load_ms = (int)ms_since(tr);
+                log_msg("model " + want + " loaded in " + std::to_string(load_ms) + " ms");
+            }
             prepare_job();
             auto tl = Clock::now();
             std::string lr = loras.apply(dit, j.loras);
             if (!lr.empty()) log_msg("LoRA " + lr);
             tm << "\"lora_ms\":" << (int)ms_since(tl);
+            if (load_ms >= 0) tm << ",\"load_ms\":" << load_ms;
 
             auto te0 = Clock::now();
             Context ctx = condition(j.pos), nctx;
