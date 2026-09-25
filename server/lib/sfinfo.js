@@ -67,7 +67,8 @@ function classify(keys, meta) {
     if (/sdxl/.test(ssBase) || /stable-diffusion-xl/.test(arch)) family = 'sdxl';
     else if (/sd_v1|sd_v1/.test(ssBase) || /stable-diffusion-v1/.test(arch)) family = 'sd15';
     else if (/flux/.test(ssBase + arch)) family = 'flux';
-  } else if (has(/^(net\.)?llm_adapter\./)) { role = 'model'; family = 'anima'; }
+  // Anima DiT under any of the prefixes trainers and ComfyUI's checkpoint save use (the engine accepts them all)
+  } else if (has(/^(net\.|model\.diffusion_model\.|diffusion_model\.|model\.|transformer\.)?llm_adapter\./)) { role = 'model'; family = 'anima'; }
   else if (keys.includes('model.diffusion_model.label_emb.0.0.weight') || has(/^conditioner\.embedders\.1\./)) { role = 'model'; family = 'sdxl'; }
   else if (has(/^model\.diffusion_model\.input_blocks\./)) { role = 'model'; family = 'sd15'; }
   else if (has(/^(model\.diffusion_model\.)?double_blocks\./)) { role = 'model'; family = 'flux'; }

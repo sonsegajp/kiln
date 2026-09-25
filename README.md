@@ -56,16 +56,16 @@ Nothing else needs to be installed beforehand: `setup.bat` fetches Node.js if yo
    git clone https://github.com/sonsegajp/kiln.git
    ```
 
-   or, while the repository is private, use the GitHub CLI (`gh auth login` once, then
-   `gh repo clone sonsegajp/kiln`). You can also download the ZIP from the repository page and unpack it.
-   Any folder works; paths with spaces are fine.
+   or use **Code → Download ZIP** on the repository page and unpack it. While the repository is private,
+   you need to be given access to it first; `git clone` then asks you to sign in to GitHub in your
+   browser. Any folder works; paths with spaces are fine.
 
 2. **Run `setup.bat`** (double-click it, or run it from a terminal). It downloads, into the Kiln folder:
 
    | What | From | Size |
    |---|---|---|
    | Node.js 24 (portable), only if Node.js 20+ isn't installed | nodejs.org | 35 MB |
-   | The engine, `kiln-engine.exe` | this repository's latest release | 7 MB |
+   | The engine, `kiln-engine.exe` | [sonsegajp/kiln-releases](https://github.com/sonsegajp/kiln-releases/releases) | 7 MB |
    | NVIDIA cuBLAS runtime DLLs | NVIDIA's CUDA redistributables | 420 MB download |
    | Anima base model, Qwen3 0.6B text encoder, Qwen-Image VAE | [circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima) | 5.6 GB |
    | Anima turbo LoRA (8-step renders) | [circlestone-labs/Anima-Official-LoRAs](https://huggingface.co/circlestone-labs/Anima-Official-LoRAs) | 150 MB |
@@ -81,8 +81,7 @@ Nothing else needs to be installed beforehand: `setup.bat` fetches Node.js if yo
    | `setup.bat --verify` | re-checks the hashes of model files that are already there |
    | `setup.bat --build` | builds the engine from source instead of downloading it (see below) |
 
-   While the repository is private, the engine download needs the GitHub CLI signed in to an account
-   with access (`gh auth login`). Without it, setup builds the engine from source instead.
+   None of these downloads need an account or a login.
 
 3. **Run `start.bat`** and open **http://localhost:8090/**. The console window is the server; close it
    to stop Kiln. The first render after starting takes longer while the models load.

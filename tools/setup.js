@@ -20,7 +20,8 @@ const ENGINE_DIR = path.join(ROOT, 'engine', 'build');
 const ENGINE_EXE = path.join(ENGINE_DIR, 'kiln-engine.exe');
 const CUDA_DIR = path.join(ROOT, 'third_party', 'cuda');
 const DL_DIR = path.join(ROOT, 'third_party', 'downloads');
-const DEFAULT_REPO = 'sonsegajp/kiln';
+// prebuilt engines are published in a public repository, so downloading needs no GitHub login
+const ENGINE_URL = process.env.KILN_ENGINE_URL || 'https://github.com/sonsegajp/kiln-releases/releases/latest/download/kiln-engine.exe';
 
 const args = new Set(process.argv.slice(2));
 const FORCE_BUILD = args.has('--build');
@@ -182,13 +183,6 @@ function checkDisk(need) {
   }
 }
 
-function repoSlug() {
-  if (process.env.KILN_REPO) return process.env.KILN_REPO;
-  const r = quiet('git', ['-C', ROOT, 'remote', 'get-url', 'origin']);
-  const m = r.status === 0 && /github\.com[:/]([^/]+\/[^/.\s]+?)(?:\.git)?\s*$/i.exec(r.stdout);
-  return m ? m[1] : DEFAULT_REPO;
-}
-
 function findVcvars() {
   const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
   const vswhere = path.join(pf86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
@@ -209,17 +203,19 @@ function looksLikeExe(f) {
   } catch { return false; }
 }
 
-function downloadPrebuilt() {
-  const repo = repoSlug(), tmp = ENGINE_EXE + '.part';
+async function downloadPrebuilt() {
+  const tmp = ENGINE_EXE + '.part';
   fs.mkdirSync(ENGINE_DIR, { recursive: true });
-  info(`downloading the prebuilt engine from github.com/${repo} (latest release)`);
-  let r = run(CURL, ['-fL', '--retry', '3', '-o', tmp, `https://github.com/${repo}/releases/latest/download/kiln-engine.exe`]);
-  if (r.status !== 0 && quiet('gh', ['--version']).status === 0) {
-    // private repositories: the GitHub CLI can fetch release assets with the user's login
-    info('trying the GitHub CLI');
-    r = run('gh', ['release', 'download', '--repo', repo, '--pattern', 'kiln-engine.exe', '--output', tmp, '--clobber']);
+  info('downloading the prebuilt engine (latest release)');
+  const sums = quiet(CURL, ['-fsSL', '--retry', '3', ENGINE_URL + '.sha256']);
+  const want = sums.status === 0 && /^[0-9a-f]{64}/i.exec(sums.stdout || '');
+  const r = run(CURL, ['-fL', '--retry', '3', '-o', tmp, ENGINE_URL]);
+  let ok = r.status === 0 && looksLikeExe(tmp);
+  if (ok && want && (await sha256(tmp, 'kiln-engine.exe')) !== want[0].toLowerCase()) {
+    info('the downloaded engine failed its SHA256 check');
+    ok = false;
   }
-  if (r.status === 0 && looksLikeExe(tmp)) { fs.renameSync(tmp, ENGINE_EXE); return true; }
+  if (ok) { fs.renameSync(tmp, ENGINE_EXE); return true; }
   try { fs.unlinkSync(tmp); } catch {}
   return false;
 }
@@ -290,7 +286,7 @@ async function ensureEngine() {
     await buildEngine();
   } else if (looksLikeExe(ENGINE_EXE)) {
     info('have engine\\build\\kiln-engine.exe');
-  } else if (!downloadPrebuilt()) {
+  } else if (!(await downloadPrebuilt())) {
     info('No prebuilt engine is available; building it from source instead.');
     await buildEngine();
   }
