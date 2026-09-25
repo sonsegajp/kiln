@@ -3,6 +3,8 @@ setlocal
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 if not exist "%VCVARS%" for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
 if not exist "%VCVARS%" (echo Visual Studio 2022 C++ build tools were not found. & exit /b 1)
+rem vcvars64.bat calls vswhere.exe itself; keep it findable so it does not print an error
+set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VCVARS%" >nul
 set CUDA=%~dp0..\third_party\cuda
 set PATH=%CUDA%\bin;%PATH%
