@@ -68,6 +68,7 @@ svg { display: block; }
 .engine-pill[data-state="mock"] .dot { background: var(--mock); box-shadow: 0 0 8px var(--mock); }
 .engine-pill[data-state="starting"] .dot { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
 .engine-pill[data-state="down"] .dot, .engine-pill[data-state="offline"] .dot { background: var(--bad); animation: pulse 1s ease-in-out infinite; }
+.engine-pill[data-state="parked"] .dot { background: #6b8cff; }
 .engine-pill[data-state="busy"] .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse .8s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
 

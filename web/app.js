@@ -93,6 +93,7 @@
     } else if (state === 'starting') {
       text = e.loading ? `Loading ${e.loading.what || ''} ${e.loading.progress != null ? Math.round(e.loading.progress * 100) + '%' : ''}` : 'Engine starting…';
     } else if (state === 'down') text = 'Engine down · restarting';
+    else if (e.parked) { state = 'parked'; text = `Parked for ${e.parked} · starts on the next render`; }
     else text = 'Engine stopped';
     pill.dataset.state = state || 'offline';
     label.textContent = text.trim();

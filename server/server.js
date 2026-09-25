@@ -178,9 +178,32 @@ const engine = new Engine({
 let engineInfo = null;
 const infoWaiters = new Map();
 
+// ---- GPU sharing: another app on this PC (for example a local LLM server) can park the engine to use the
+// VRAM. A parked engine is stopped; the next render unparks it, first asking the holder to let go of the
+// GPU through its release URL so the engine never loads next to the other app's model.
+let parked = null;  // { holder, release_url, since }
+const engineStatus = () => Object.assign(engine.status(), parked ? { parked: parked.holder } : {});
+async function releaseHolder(p) {
+  if (!p.release_url) return;
+  try {
+    const r = await fetch(p.release_url, { method: 'POST', signal: AbortSignal.timeout(90000) });
+    log(`${p.holder} released the GPU (HTTP ${r.status})`);
+  } catch (e) {
+    log(`${p.holder} did not answer its release URL (${e.message}); starting the engine anyway`);
+  }
+}
+function unpark(reason) {
+  if (!parked) return;
+  const p = parked;
+  parked = null;
+  log(`engine unparked (${reason}); it was parked for ${p.holder}`);
+  broadcast({ type: 'engine', engine: engineStatus() });
+  releaseHolder(p).then(() => { if (!engine.proc && !parked) engine.start(); });
+}
+
 engine.on('log', (m) => log(m));
 engine.on('state', () => {
-  broadcast({ type: 'engine', engine: engine.status() });
+  broadcast({ type: 'engine', engine: engineStatus() });
   if (engine.state === 'ready') {
     // learn engine capabilities (e.g. features.face === false) before the first job
     if (!running) engineInfoRequest(3000).then((ev) => { if (ev) broadcast({ type: 'features', features: features() }); });
@@ -458,6 +481,7 @@ function createJobs(p) {
 }
 
 function pump() {
+  if (parked) { if (queue.length) unpark('a render was queued'); return; }
   if (running || engine.state !== 'ready' || !queue.length) return;
   const j = queue.shift();
   running = j;
@@ -556,7 +580,7 @@ function onEngineEvent(ev) {
     if (w) { infoWaiters.delete(ev.id); w(ev); }
     return;
   }
-  if (ev.ev === 'loading' && !ev.id) { broadcast({ type: 'engine', engine: engine.status() }); return; }
+  if (ev.ev === 'loading' && !ev.id) { broadcast({ type: 'engine', engine: engineStatus() }); return; }
   const j = ev.id ? jobs.get(ev.id) : null;
   if (!j) {
     if (ev.ev === 'error') log(`engine error${ev.id ? ' (' + ev.id + ')' : ''}: ${ev.msg}`);
@@ -1355,7 +1379,7 @@ function lanUrls() {
 
 function serverInfo() {
   return {
-    name: 'kiln', version: VERSION, mock: engine.mock, engine_exe: ENGINE_EXE, engine: engine.status(),
+    name: 'kiln', version: VERSION, mock: engine.mock, engine_exe: ENGINE_EXE, engine: engineStatus(),
     models_dir: MODELS, outputs_dir: OUTPUTS, t5_mode: getT5Mode(), lan: lanUrls().map(u => u.url),
     port: PORT, node: process.version, features: features(), extensions: packs.summary(),
   };
@@ -1440,6 +1464,25 @@ async function handle(req, res) {
       return sendJSON(res, 200, { cancelled });
     }
     if (p === '/api/queue' && m === 'GET') return sendJSON(res, 200, queueSnapshot());
+    if (p === '/api/engine' && m === 'GET') return sendJSON(res, 200, engineStatus());
+    if (p === '/api/engine/park' && m === 'POST') {
+      if (!isLoopback(req)) return sendJSON(res, 403, { error: 'only apps on this PC can park the engine' });
+      let b = {};
+      try { b = await readJSON(req); } catch (_) { }
+      if (running || queue.length) return sendJSON(res, 409, { error: 'busy', running: !!running, queued: queue.length });
+      const url = typeof b.release_url === 'string' && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(b.release_url) ? b.release_url : null;
+      parked = { holder: String(b.holder || 'another app').slice(0, 40), release_url: url, since: Date.now() };
+      if (engine.proc) await new Promise((r) => { const t = setTimeout(r, 10000); engine.once('exit', () => { clearTimeout(t); r(); }); engine.stop(); });
+      else engine.stop();  // also cancels a pending restart
+      log(`engine parked: VRAM freed for ${parked.holder}`);
+      broadcast({ type: 'engine', engine: engineStatus() });
+      return sendJSON(res, 200, engineStatus());
+    }
+    if (p === '/api/engine/unpark' && m === 'POST') {
+      if (!isLoopback(req)) return sendJSON(res, 403, { error: 'only apps on this PC can unpark the engine' });
+      unpark('requested');
+      return sendJSON(res, 200, engineStatus());
+    }
     if (p.startsWith('/api/job/') && m === 'GET') {
       const j = jobs.get(p.slice(9));
       return j ? sendJSON(res, 200, publicJob(j)) : sendJSON(res, 404, { error: 'no such job' });
