@@ -953,7 +953,7 @@
       faceInset.hidden = false;
     } catch (_) { }
   }
-  // ---- per-stage timeline (base -> hires -> face per detected face), mirrored from step events
+  // ---- per-stage timeline (base -> face per detected face -> hires), mirrored from step events
   function pushTimeline(j, m) {
     j.timeline = j.timeline || [];
     const stage = m.stage || 'base';
@@ -973,10 +973,12 @@
     let base = tl.find(g => g.stage === 'base');
     if (!base) base = { stage: 'base', of: p.steps || j.of || 0, ms: (j.step_ms || []).slice() };
     out.push(base);
-    if (p.hires) out.push(tl.find(g => g.stage === 'hires') || { stage: 'hires', of: p.hires.steps || 0, ms: [] });
+    // faces are redrawn at the base size, before the hires pass
+    const hires = tl.find(g => g.stage === 'hires');
     const faces = tl.filter(g => g.stage === 'face');
     if (faces.length) out.push(...faces);
-    else if (p.face && j.status === 'running') out.push({ stage: 'face', of: p.face.steps || 0, ms: [], face: 1, maybe: true });
+    else if (p.face && j.status === 'running' && !hires) out.push({ stage: 'face', of: p.face.steps || 0, ms: [], face: 1, maybe: true });
+    if (p.hires) out.push(hires || { stage: 'hires', of: p.hires.steps || 0, ms: [] });
     for (const g of tl) if (!['base', 'hires', 'face'].includes(g.stage)) out.push(g);
     return out;
   }
@@ -1110,13 +1112,13 @@
       ['Encode', j.encode_ms != null ? fmtMs(j.encode_ms) : (running && j.kind !== 'graph' ? '…' : '–')],
       ['Per step', sm.length ? `${(sum(sm) / sm.length / 1000).toFixed(2)} s/it` : '–'],
     );
-    if (p.hires) { const g = tl.find(x => x.stage === 'hires'); const ms = t.hires_ms != null ? t.hires_ms : (g && g.ms.length ? sum(g.ms) : null); items.push([`Hires ${p.hires.scale}×`, ms != null ? fmtMs(ms) : (running ? '…' : '–')]); }
     if (p.face) {
       const fg = tl.filter(x => x.stage === 'face');
       const n = t.faces != null ? t.faces : fg.length;
       const ms = t.face_ms != null ? t.face_ms : (fg.length ? sum(fg.flatMap(g => g.ms)) : null);
       items.push(['Faces', finished && !n ? 'none found' : ms != null ? `${n} · ${fmtMs(ms)}` : (running ? '…' : '–')]);
     }
+    if (p.hires) { const g = tl.find(x => x.stage === 'hires'); const ms = t.hires_ms != null ? t.hires_ms : (g && g.ms.length ? sum(g.ms) : null); items.push([`Hires ${p.hires.scale}×`, ms != null ? fmtMs(ms) : (running ? '…' : '–')]); }
     if (p.upscale) items.push([`Upscale ${p.upscale.factor}×`, t.upscale_ms != null ? fmtMs(t.upscale_ms) : (running ? '…' : '–')]);
     if (t.cache_skips != null) items.push(['Cache', `${t.cache_skips} skipped`]);
     items.push(['Decode', j.decode_ms != null ? fmtMs(j.decode_ms) : '–']);

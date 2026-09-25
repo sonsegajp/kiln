@@ -180,23 +180,6 @@
             </div>
           </div>
 
-          <details class="a-acc" id="accHires" data-only="txt2img">
-            <summary><label class="a-acc-check"><input type="checkbox" id="hiresOn"><span>Hires. fix</span></label><span class="a-acc-sum" id="hiresSum"></span></summary>
-            <div class="a-acc-body">
-              <div class="a-row">
-                <div class="a-field"><label for="hiresUpscaler">Upscaler</label><select id="hiresUpscaler"><option value="lanczos">Lanczos</option><option value="model">4x-AnimeSharp (model)</option></select></div>
-                <div class="a-slider" data-key="hires.steps" data-label="Hires steps" data-min="1" data-max="50" data-step="1"></div>
-                <div class="a-slider" data-key="hires.denoise" data-label="Denoising strength" data-min="0.05" data-max="1" data-step="0.01"></div>
-              </div>
-              <div class="a-row">
-                <div class="a-slider" data-key="hires.scale" data-label="Upscale by" data-min="1" data-max="4" data-step="0.05"></div>
-                <div class="a-slider" data-key="hires.tw" data-label="Resize width to" data-min="0" data-max="4096" data-step="16"></div>
-                <div class="a-slider" data-key="hires.th" data-label="Resize height to" data-min="0" data-max="4096" data-step="16"></div>
-              </div>
-              <div class="a-hint" id="hiresNote"></div>
-            </div>
-          </details>
-
           <details class="a-acc" id="accFace" data-only="txt2img">
             <summary><label class="a-acc-check"><input type="checkbox" id="faceOn"><span>Face Detailer</span></label><span class="a-acc-sum" id="faceSum"></span></summary>
             <div class="a-acc-body">
@@ -215,6 +198,23 @@
                 <div class="a-slider" data-key="face.crop" data-label="Crop factor" data-min="1" data-max="6" data-step="0.1"></div>
               </div>
               <div class="a-hint" id="faceNote"></div>
+            </div>
+          </details>
+
+          <details class="a-acc" id="accHires" data-only="txt2img">
+            <summary><label class="a-acc-check"><input type="checkbox" id="hiresOn"><span>Hires. fix</span></label><span class="a-acc-sum" id="hiresSum"></span></summary>
+            <div class="a-acc-body">
+              <div class="a-row">
+                <div class="a-field"><label for="hiresUpscaler">Upscaler</label><select id="hiresUpscaler"><option value="lanczos">Lanczos</option><option value="model">4x-AnimeSharp (model)</option></select></div>
+                <div class="a-slider" data-key="hires.steps" data-label="Hires steps" data-min="1" data-max="50" data-step="1"></div>
+                <div class="a-slider" data-key="hires.denoise" data-label="Denoising strength" data-min="0.05" data-max="1" data-step="0.01"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="hires.scale" data-label="Upscale by" data-min="1" data-max="4" data-step="0.05"></div>
+                <div class="a-slider" data-key="hires.tw" data-label="Resize width to" data-min="0" data-max="4096" data-step="16"></div>
+                <div class="a-slider" data-key="hires.th" data-label="Resize height to" data-min="0" data-max="4096" data-step="16"></div>
+              </div>
+              <div class="a-hint" id="hiresNote"></div>
             </div>
           </details>
 

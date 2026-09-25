@@ -711,6 +711,16 @@ struct Engine {
             emit("{\"id\":" + json_escape(j.id) + ",\"ev\":\"decoded\",\"ms\":" + std::to_string((int)dec_ms) + "}");
             tm << ",\"decode_ms\":" << (int)dec_ms;
 
+#ifdef KILN_FACE
+            // faces first, at the base size: the hires pass then refines them along with the rest
+            if (j.face.on) {
+                auto tf = Clock::now();
+                double fs_ms = 0;
+                int n = face_detail(img, H, W, ctx, neg, j, &fs_ms, use_nag ? &nctx : nullptr);
+                gpu_sync();
+                tm << ",\"faces\":" << n << ",\"face_ms\":" << (int)ms_since(tf);
+            }
+#endif
             if (j.hires.scale > 1.01f) {  // hires fix: enlarge, then redraw at the new size with partial denoise
                 auto th = Clock::now();
                 int H2 = round16(H * j.hires.scale), W2 = round16(W * j.hires.scale), Hl2 = H2 / 8, Wl2 = W2 / 8, P2 = Hl2 * Wl2;
@@ -730,15 +740,6 @@ struct Engine {
                 tm << ",\"hires_ms\":" << (int)ms_since(th);
             }
 
-#ifdef KILN_FACE
-            if (j.face.on) {
-                auto tf = Clock::now();
-                double fs_ms = 0;
-                int n = face_detail(img, H, W, ctx, neg, j, &fs_ms, use_nag ? &nctx : nullptr);
-                gpu_sync();
-                tm << ",\"faces\":" << n << ",\"face_ms\":" << (int)ms_since(tf);
-            }
-#endif
             if (j.upscale > 1) {
                 auto tu = Clock::now();
                 int H2 = H * j.upscale, W2 = W * j.upscale;
