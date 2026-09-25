@@ -1,0 +1,9 @@
+{
+  "name": "kiln-image",
+  "version": "1.0.0",
+  "description": "Image adjust (brightness / contrast / saturation), flip, rotate and crop. Flip, rotate and crop are ports of ComfyUI's core nodes with the same names and inputs. ui.js adds a slider widget.",
+  "author": "Kiln",
+  "url": "",
+  "nodes": "nodes.js",
+  "ui": "ui.js"
+}

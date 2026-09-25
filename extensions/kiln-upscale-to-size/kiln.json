@@ -1,0 +1,8 @@
+{
+  "name": "kiln-upscale-to-size",
+  "version": "1.0.0",
+  "description": "Upscale Image To Size: runs an upscale model (e.g. 4x-AnimeSharp), then resizes to an exact target size. Example of engine calls from a pack (ctx.ops.upscale + ctx.ops.resize).",
+  "author": "Kiln",
+  "url": "",
+  "nodes": "nodes.js"
+}

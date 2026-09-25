@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f19">
+<meta name="color-scheme" content="dark">
+<title>Kiln</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='1' x2='0' y2='0'%3E%3Cstop offset='0' stop-color='%23ff5a2a'/%3E%3Cstop offset='1' stop-color='%23ffc05a'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2c1 5 7 8 7 15a7 7 0 0 1-14 0c0-3 1.5-5 3-6.5.3 2.5 1.5 4 3 4.5-1-4 0-9 1-13z'/%3E%3Crect x='5' y='25' width='22' height='4' rx='2' fill='%23ff7a3d'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="a1.css">
+<link rel="stylesheet" href="nodes.css">
+<link rel="stylesheet" href="extensions.css">
+</head>
+<body>
+<header class="topbar a-top">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="bg1" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#ff5a2a"/><stop offset="1" stop-color="#ffc05a"/></linearGradient></defs><path fill="url(#bg1)" d="M16 2c1 5 7 8 7 15a7 7 0 0 1-14 0c0-3 1.5-5 3-6.5.3 2.5 1.5 4 3 4.5-1-4 0-9 1-13z"/><rect x="5" y="25" width="22" height="4" rx="2" fill="#ff7a3d"/></svg>
+    <span class="brand-name">Kiln</span>
+  </div>
+  <div class="ckpt" id="ckptBox">
+    <label class="ckpt-label" for="ckptSel">Stable Diffusion checkpoint</label>
+    <div class="ckpt-row">
+      <select id="ckptSel" aria-label="Stable Diffusion checkpoint"><option>Loading…</option></select>
+      <button type="button" class="a-icon" id="ckptRefresh" title="Refresh models">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="engine-pill" id="enginePill" data-state="connecting" title="Engine status">
+    <span class="dot"></span><span class="label" id="engineLabel">Connecting…</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="avg-speed" id="avgSpeed" title="Average seconds per image, last 10 renders">
+    <span class="v" id="avgSpeedVal">–</span><span class="u">s/img avg</span>
+  </div>
+  <button class="pack-btn" id="packBtn" type="button" title="Extensions (node packs)">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 3a2 2 0 0 1 4 0v2h4a1 1 0 0 1 1 1v4h-2a2 2 0 0 0 0 4h2v4a1 1 0 0 1-1 1h-4v-2a2 2 0 0 0-4 0v2H6a1 1 0 0 1-1-1v-4h2a2 2 0 0 0 0-4H5V6a1 1 0 0 1 1-1h4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+    <span class="lbl">Extensions</span><span class="pack-count" id="packCount"></span>
+  </button>
+  <button class="queue-pill" id="queuePill" type="button" aria-haspopup="true" aria-expanded="false">
+    <span class="qdot"></span><span id="queueLabel">Idle</span>
+  </button>
+  <div class="queue-pop" id="queuePop" hidden>
+    <div class="queue-pop-head"><span>Queue</span><button type="button" class="link danger" id="queueCancelAll">Cancel all</button></div>
+    <ol class="queue-list" id="queueList"></ol>
+  </div>
+</header>
+
+<nav class="a-tabs" id="modeSwitch" role="tablist" aria-label="Tabs">
+  <button type="button" role="tab" data-tab="txt2img" data-mode="simple" aria-selected="true">txt2img</button>
+  <button type="button" role="tab" data-tab="img2img" data-mode="img2img" aria-selected="false">img2img</button>
+  <button type="button" role="tab" data-tab="extras" data-mode="extras" aria-selected="false">Extras</button>
+  <button type="button" role="tab" data-tab="pnginfo" data-mode="pnginfo" aria-selected="false">PNG Info</button>
+  <button type="button" role="tab" data-tab="nodes" data-mode="nodes" aria-selected="false">Nodes</button>
+  <button type="button" role="tab" data-tab="settings" data-mode="settings" aria-selected="false">Settings</button>
+</nav>
+
+<div class="banner" id="mockBanner" hidden>
+  <strong>Mock engine.</strong> <span id="mockBannerText">kiln-engine.exe wasn't found, so images are fake gradients. The server switches to the real engine automatically once it's built.</span>
+</div>
+
+<main class="a-main" id="layout">
+  <!-- ======================================================= txt2img / img2img -->
+  <section class="a-panel a-gen" id="genPanel" data-tab-panel="txt2img img2img">
+    <div class="a-cols">
+      <div class="a-left" id="controls">
+        <div class="a-prompt-row">
+          <div class="a-prompts">
+            <div class="a-tb" id="promptBox">
+              <textarea id="prompt" rows="3" spellcheck="false" placeholder="Prompt (press Ctrl+Enter to generate)"></textarea>
+              <span class="a-tok" id="tokCount" title="Tokens (Qwen / T5)"></span>
+            </div>
+            <div class="a-tb" id="negField">
+              <textarea id="negative" rows="2" spellcheck="false" placeholder="Negative prompt (press Ctrl+Enter to generate)"></textarea>
+              <span class="a-tok" id="tokNeg" title="Tokens (Qwen / T5)"></span>
+            </div>
+          </div>
+          <div class="a-gen-side" id="actions">
+            <div class="a-gen-btns">
+              <button type="button" class="a-generate" id="generateBtn"><span id="generateLabel">Generate</span></button>
+              <div class="a-busy" id="genBusy" hidden>
+                <button type="button" class="a-btn" id="interruptBtn" title="Stop the current batch">Interrupt</button>
+                <button type="button" class="a-btn" id="skipBtn" title="Skip the current image, continue the batch">Skip</button>
+              </div>
+            </div>
+            <div class="a-tools">
+              <button type="button" class="a-tool" id="toolReuse" title="Read generation parameters from the last image into the UI">↙️</button>
+              <button type="button" class="a-tool" id="toolClear" title="Clear prompt">🗑️</button>
+              <button type="button" class="a-tool" id="toolNets" title="Show/hide extra networks">🎴</button>
+              <button type="button" class="a-tool" id="toolCivitai" title="Open the CivitAI browser">🌐</button>
+            </div>
+            <div class="a-preset">
+              <select id="presetSel" aria-label="Presets"><option value="">Presets…</option></select>
+              <button type="button" class="a-tool sm" id="presetSave" title="Save the current settings (sampler, size, LoRA slots, options) as a preset">💾</button>
+              <button type="button" class="a-tool sm" id="presetDel" title="Delete the selected preset">✖</button>
+            </div>
+            <div class="a-quick">
+              <button type="button" class="a-chipbtn" id="presetBase" aria-pressed="false" title="Base Anima: turbo LoRA off, 20 steps, CFG 4.5, DPM++ 2M, CFG cutoff 0.7">Base</button>
+              <button type="button" class="a-chipbtn" id="presetTurbo" aria-pressed="false" title="Turbo LoRA 1.0, 8 steps, CFG 1, Euler">Turbo</button>
+            </div>
+            <div class="a-warn" id="genWarn" hidden></div>
+          </div>
+        </div>
+
+        <section class="a-block a-i2i" id="i2iBox" hidden>
+          <div class="a-subtabs" id="i2iTabs" role="tablist">
+            <button type="button" role="tab" data-i="img2img" aria-selected="true">img2img</button>
+            <button type="button" role="tab" data-i="inpaint" aria-selected="false">Inpaint</button>
+          </div>
+          <div class="a-drop" id="i2iDrop" tabindex="0">
+            <canvas id="i2iCanvas" width="1" height="1" hidden></canvas>
+            <canvas id="i2iMask" width="1" height="1" hidden></canvas>
+            <div class="a-drop-hint" id="i2iHint">Drop an image here, paste, or <button type="button" class="a-link" id="i2iPick">click to upload</button></div>
+            <input type="file" id="i2iFile" accept="image/*" hidden>
+          </div>
+          <div class="a-mask-tools" id="maskTools" hidden>
+            <label class="a-inl">Brush <input type="range" id="brushSize" min="4" max="200" step="1" value="48"><output id="brushSizeV">48</output></label>
+            <label class="a-inl">Mask blur <input type="number" id="maskBlur" min="0" max="64" step="1" value="4"></label>
+            <button type="button" class="a-btn sm" id="maskErase" aria-pressed="false">Eraser</button>
+            <button type="button" class="a-btn sm" id="maskClear">Clear mask</button>
+            <span class="a-hint">Paint the area to redraw.</span>
+          </div>
+          <div class="a-row">
+            <div class="a-field">
+              <label>Resize mode</label>
+              <div class="a-radio" id="resizeMode" role="radiogroup">
+                <button type="button" data-v="just" aria-checked="true">Just resize</button>
+                <button type="button" data-v="crop" aria-checked="false">Crop and resize</button>
+                <button type="button" data-v="fill" aria-checked="false">Resize and fill</button>
+              </div>
+            </div>
+          </div>
+          <div class="a-slider" data-key="denoise" data-label="Denoising strength" data-min="0" data-max="1" data-step="0.01"></div>
+          <div class="a-row a-i2i-clear"><button type="button" class="a-btn sm" id="i2iClear">Remove image</button><span class="a-hint" id="i2iInfo"></span></div>
+        </section>
+
+
+        <section class="a-block a-xnet" id="xnet" hidden>
+          <div class="a-subtabs" id="xnetTabs" role="tablist">
+            <button type="button" role="tab" data-x="lora" aria-selected="true">Lora</button>
+            <button type="button" role="tab" data-x="ckpt" aria-selected="false">Checkpoints</button>
+            <button type="button" role="tab" data-x="civitai" aria-selected="false">CivitAI</button>
+          </div>
+          <div class="a-xnet-bar">
+            <input type="search" id="xnetSearch" placeholder="Search" autocomplete="off" spellcheck="false">
+            <select id="xnetSort" aria-label="Sort local cards"><option value="name">Name</option><option value="new">Newest</option><option value="base">Base model</option></select>
+            <button type="button" class="a-icon" id="xnetRefresh" title="Refresh">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+          <div class="a-cards" id="xnetCards"></div>
+          <div class="cv-host" id="cvHostInline" hidden></div>
+        </section>
+
+        <section class="a-block a-params" id="params">
+          <div class="a-row">
+            <div class="a-field"><label for="sampler">Sampling method</label><select id="sampler"></select></div>
+            <div class="a-field"><label for="scheduler">Schedule type</label><select id="scheduler"></select></div>
+          </div>
+          <div class="a-slider" data-key="steps" data-label="Sampling steps" data-min="1" data-max="150" data-step="1"></div>
+          <div class="a-row a-size-row">
+            <div class="a-col">
+              <div class="a-slider" data-key="width" data-label="Width" data-min="256" data-max="2048" data-step="16"></div>
+              <div class="a-slider" data-key="height" data-label="Height" data-min="256" data-max="2048" data-step="16"></div>
+            </div>
+            <button type="button" class="a-icon a-swap" id="swapWH" title="Swap width/height">⇅</button>
+            <div class="a-col">
+              <div class="a-slider" data-key="batchCount" data-label="Batch count" data-min="1" data-max="100" data-step="1"></div>
+              <div class="a-slider" data-key="batchSize" data-label="Batch size" data-min="1" data-max="8" data-step="1"></div>
+            </div>
+          </div>
+          <div class="a-slider" data-key="cfg" data-label="CFG Scale" data-min="1" data-max="30" data-step="0.5"></div>
+          <div class="a-field a-seed">
+            <label for="seed">Seed</label>
+            <div class="a-seed-row">
+              <input type="text" id="seed" inputmode="numeric" autocomplete="off" value="-1">
+              <button type="button" class="a-tool" id="seedRandom" title="Set seed to -1 (random every time)">🎲</button>
+              <button type="button" class="a-tool" id="seedReuse" title="Reuse the seed of the last image">♻️</button>
+            </div>
+          </div>
+
+          <details class="a-acc" id="accHires" data-only="txt2img">
+            <summary><label class="a-acc-check"><input type="checkbox" id="hiresOn"><span>Hires. fix</span></label><span class="a-acc-sum" id="hiresSum"></span></summary>
+            <div class="a-acc-body">
+              <div class="a-row">
+                <div class="a-field"><label for="hiresUpscaler">Upscaler</label><select id="hiresUpscaler"><option value="lanczos">Lanczos</option><option value="model">4x-AnimeSharp (model)</option></select></div>
+                <div class="a-slider" data-key="hires.steps" data-label="Hires steps" data-min="1" data-max="50" data-step="1"></div>
+                <div class="a-slider" data-key="hires.denoise" data-label="Denoising strength" data-min="0.05" data-max="1" data-step="0.01"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="hires.scale" data-label="Upscale by" data-min="1" data-max="4" data-step="0.05"></div>
+                <div class="a-slider" data-key="hires.tw" data-label="Resize width to" data-min="0" data-max="4096" data-step="16"></div>
+                <div class="a-slider" data-key="hires.th" data-label="Resize height to" data-min="0" data-max="4096" data-step="16"></div>
+              </div>
+              <div class="a-hint" id="hiresNote"></div>
+            </div>
+          </details>
+
+          <details class="a-acc" id="accFace" data-only="txt2img">
+            <summary><label class="a-acc-check"><input type="checkbox" id="faceOn"><span>Face Detailer</span></label><span class="a-acc-sum" id="faceSum"></span></summary>
+            <div class="a-acc-body">
+              <div class="a-row">
+                <div class="a-field"><label>Detector</label><select id="faceModel"><option>face_yolov8m.pt</option></select></div>
+                <div class="a-slider" data-key="face.conf" data-label="Detection confidence" data-min="0.05" data-max="0.95" data-step="0.01"></div>
+                <div class="a-slider" data-key="face.max_faces" data-label="Max faces" data-min="1" data-max="16" data-step="1"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="face.denoise" data-label="Inpaint denoising strength" data-min="0.05" data-max="1" data-step="0.01"></div>
+                <div class="a-slider" data-key="face.steps" data-label="Inpaint steps" data-min="1" data-max="50" data-step="1"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="face.guide" data-label="Inpaint size" data-min="128" data-max="1536" data-step="16"></div>
+                <div class="a-slider" data-key="face.max_size" data-label="Max size" data-min="128" data-max="2048" data-step="16"></div>
+                <div class="a-slider" data-key="face.crop" data-label="Crop factor" data-min="1" data-max="6" data-step="0.1"></div>
+              </div>
+              <div class="a-hint" id="faceNote"></div>
+            </div>
+          </details>
+
+          <details class="a-acc" id="accLora" open>
+            <summary><span class="a-acc-title">LoRA</span><span class="a-acc-sum" id="loraSum"></span></summary>
+            <div class="a-acc-body">
+              <div class="a-slots" id="loraSlots"></div>
+              <div class="a-row a-slot-actions">
+                <button type="button" class="a-btn sm" id="slotAdd">+ Add slot</button>
+                <span class="a-hint">Prompt tags like &lt;lora:name:0.8&gt; are added on top of the slots.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="a-acc" id="accKiln">
+            <summary><span class="a-acc-title">Kiln options</span><span class="a-acc-sum" id="kilnSum"></span></summary>
+            <div class="a-acc-body">
+              <div class="a-row">
+                <label class="a-check"><input type="checkbox" id="nagOn"><span>Negative at CFG 1 (NAG)</span></label>
+                <span class="a-hint" id="nagHint"></span>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="nag.scale" data-label="NAG scale" data-min="1" data-max="10" data-step="0.5"></div>
+                <div class="a-slider" data-key="nag.tau" data-label="NAG tau" data-min="1" data-max="10" data-step="0.1"></div>
+                <div class="a-slider" data-key="nag.alpha" data-label="NAG alpha" data-min="0" data-max="1" data-step="0.05"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-slider" data-key="cfgCutoff" data-label="CFG cutoff (CFG > 1: negative only for the first part)" data-min="0.1" data-max="1" data-step="0.05"></div>
+                <div class="a-slider" data-key="shift" data-label="Shift" data-min="0" data-max="12" data-step="0.1"></div>
+              </div>
+              <div class="a-row">
+                <div class="a-field"><label>Step cache</label>
+                  <div class="a-radio" id="cacheSeg" role="radiogroup">
+                    <button type="button" data-v="0">Off</button><button type="button" data-v="0.05">Light</button><button type="button" data-v="0.1">Medium</button><button type="button" data-v="0.15">Strong</button>
+                  </div>
+                </div>
+                <div class="a-field" data-only="txt2img"><label>Final upscale (4x model)</label>
+                  <div class="a-radio" id="upSeg" role="radiogroup">
+                    <button type="button" data-v="0">Off</button><button type="button" data-v="2">2×</button><button type="button" data-v="4">4×</button>
+                  </div>
+                </div>
+              </div>
+              <div class="a-hint" id="kilnHint"></div>
+            </div>
+          </details>
+        </section>
+      </div>
+
+      <div class="a-right" id="stageCol">
+        <div class="a-block a-out">
+          <div class="a-stage" id="stage">
+            <div class="frame" id="frame" data-state="empty">
+              <canvas id="previewCanvas" width="1" height="1"></canvas>
+              <img id="finalImg" alt="" decoding="async">
+              <div class="empty-state" id="emptyState">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><path fill="currentColor" d="M16 2c1 5 7 8 7 15a7 7 0 0 1-14 0c0-3 1.5-5 3-6.5.3 2.5 1.5 4 3 4.5-1-4 0-9 1-13z"/></svg>
+              </div>
+              <div class="stage-top"><div class="progress"><div class="progress-bar" id="progressBar"></div></div></div>
+              <div class="face-inset" id="faceInset" hidden><canvas id="faceCanvas" width="1" height="1"></canvas><span id="faceInsetLabel">Face</span></div>
+              <div class="stage-badge" id="stageBadge" hidden></div>
+              <button class="stage-open" id="stageOpen" type="button" title="Open full size" hidden>
+                <svg viewBox="0 0 24 24"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="stats a-stats" id="stats">
+            <div class="stat-big" id="statBig" data-live="0">
+              <span class="num" id="bigNum">–</span>
+              <span class="unit">seconds / image</span>
+              <span class="a-eta" id="etaLine" hidden></span>
+            </div>
+            <div class="stat-detail">
+              <div class="steps-viz" id="stepsViz" aria-label="per-step timing"></div>
+              <div class="a-stgs" id="stageBars"></div>
+              <dl class="breakdown" id="breakdown"></dl>
+            </div>
+          </div>
+          <div class="a-thumbs" id="outThumbs"></div>
+          <div class="a-out-btns" id="outBtns">
+            <button type="button" class="a-btn" id="outFolder" title="Open the images folder (on the PC running Kiln)">📂</button>
+            <button type="button" class="a-btn" id="outSave" title="Download the selected image">Save</button>
+            <button type="button" class="a-btn" id="outZip" title="Download all images of this batch as a zip">Zip</button>
+            <button type="button" class="a-btn" id="outI2i" title="Send image and generation parameters to the img2img tab">Send to img2img</button>
+            <button type="button" class="a-btn" id="outInpaint" title="Send image and generation parameters to img2img inpaint">Send to inpaint</button>
+            <button type="button" class="a-btn" id="outExtras" title="Send image to the Extras tab">Send to extras</button>
+          </div>
+          <div class="a-info" id="infoText" aria-label="Generation info"></div>
+          <div class="a-timing" id="outTiming"></div>
+        </div>
+        <details class="a-block a-history" id="history">
+          <summary>History <span class="count" id="galCount"></span></summary>
+          <div class="gallery" id="gallery"><div class="gallery-sentinel" id="gallerySentinel"></div></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================= Extras -->
+  <section class="a-panel" id="extrasPanel" data-tab-panel="extras" hidden>
+    <div class="a-cols">
+      <div class="a-left">
+        <div class="a-block">
+          <div class="a-drop" id="exDrop" tabindex="0">
+            <img id="exImg" alt="" hidden>
+            <div class="a-drop-hint" id="exHint">Drop an image here, paste, or <button type="button" class="a-link" id="exPick">click to upload</button></div>
+            <input type="file" id="exFile" accept="image/*" hidden>
+          </div>
+          <div class="a-row">
+            <div class="a-field"><label for="exUpscaler">Upscaler</label><select id="exUpscaler"></select></div>
+            <div class="a-slider" data-key="ex.scale" data-label="Resize" data-min="1" data-max="8" data-step="0.25"></div>
+          </div>
+          <div class="a-hint" id="exNote"></div>
+          <button type="button" class="a-generate a-wide" id="exGo">Generate</button>
+        </div>
+      </div>
+      <div class="a-right">
+        <div class="a-block a-out">
+          <div class="a-exout" id="exOut"><div class="a-drop-hint">The upscaled image appears here.</div></div>
+          <div class="a-out-btns"><a class="a-btn" id="exSave" href="#" download hidden>Save</a><button type="button" class="a-btn" id="exToI2i" hidden>Send to img2img</button></div>
+          <div class="a-info" id="exInfo"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================= PNG Info -->
+  <section class="a-panel" id="pngPanel" data-tab-panel="pnginfo" hidden>
+    <div class="a-cols">
+      <div class="a-left">
+        <div class="a-block">
+          <div class="a-drop" id="piDrop" tabindex="0">
+            <img id="piImg" alt="" hidden>
+            <div class="a-drop-hint" id="piHint">Drop a PNG here, paste, or <button type="button" class="a-link" id="piPick">click to upload</button></div>
+            <input type="file" id="piFile" accept="image/png,image/*" hidden>
+          </div>
+        </div>
+      </div>
+      <div class="a-right">
+        <div class="a-block">
+          <div class="a-pi-out" id="piOut"><div class="a-hint">Parameters from Kiln, A1111 and ComfyUI images show here.</div></div>
+          <div class="a-out-btns" id="piBtns" hidden>
+            <button type="button" class="a-btn" id="piToTxt">Send to txt2img</button>
+            <button type="button" class="a-btn" id="piToI2i">Send to img2img</button>
+            <button type="button" class="a-btn" id="piToInpaint">Send to inpaint</button>
+            <button type="button" class="a-btn" id="piToExtras">Send to extras</button>
+            <button type="button" class="a-btn" id="piToNodes" hidden>Open in Nodes</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================= Settings -->
+  <section class="a-panel" id="settingsPanel" data-tab-panel="settings" hidden>
+    <div class="a-settings" id="settingsBody"></div>
+  </section>
+</main>
+
+<section class="nodes-view" id="nodesView" hidden>
+  <div class="ng-toolbar" id="ngToolbar">
+    <button type="button" class="ng-btn ng-primary" id="ngQueue" title="Queue (Ctrl+Enter)">
+      <svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z" fill="currentColor"/></svg><span>Queue</span>
+    </button>
+    <input type="number" class="ng-count" id="ngCount" min="1" max="64" value="1" title="How many times to queue (seeds follow control_after_generate)">
+    <button type="button" class="ng-btn" id="ngCancel" title="Cancel this graph's queued/running jobs">Cancel</button>
+    <span class="ng-sep"></span>
+    <button type="button" class="ng-btn" id="ngAdd" title="Add node (double-click canvas)">+ Add</button>
+    <button type="button" class="ng-btn" id="ngTemplates">Templates ▾</button>
+    <button type="button" class="ng-btn" id="ngWorkflows">Workflows ▾</button>
+    <button type="button" class="ng-btn" id="ngOpen" title="Open a Kiln / ComfyUI .json or a PNG with a workflow">Open…</button>
+    <input type="file" id="ngFile" accept=".json,.png,application/json,image/png" hidden>
+    <button type="button" class="ng-btn" id="ngExport">Export ▾</button>
+    <span class="ng-sep"></span>
+    <button type="button" class="ng-btn" id="ngFit" title="Fit view (F)">Fit</button>
+    <button type="button" class="ng-btn" id="ngUndo" title="Undo (Ctrl+Z)">Undo</button>
+    <button type="button" class="ng-btn" id="ngClear">Clear</button>
+    <span class="ng-status" id="ngStatus"></span>
+  </div>
+  <div class="ng-banner" id="ngBanner" hidden></div>
+  <div class="ng-view" id="ngView">
+    <div class="ng-world" id="ngWorld">
+      <svg class="ng-links" id="ngLinks" aria-hidden="true"><g transform="translate(50000,50000)"><g id="ngLinkG"></g><path id="ngTemp" class="ng-link temp"/></g></svg>
+      <div class="ng-nodes" id="ngNodes"></div>
+    </div>
+    <div class="ng-box" id="ngBox" hidden></div>
+    <div class="ng-empty" id="ngEmpty" hidden>
+      <p><b>Empty graph.</b> Double-click (or long-press) the canvas to add a node, drop a ComfyUI workflow / PNG here, or start from a template:</p>
+      <div class="ng-templates" id="ngEmptyTemplates"></div>
+    </div>
+    <div class="ng-search" id="ngSearch" hidden>
+      <input type="text" id="ngSearchInput" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
+      <div class="ng-search-hint" id="ngSearchHint"></div>
+      <div class="ng-search-list" id="ngSearchList"></div>
+    </div>
+  </div>
+  <button type="button" class="ng-fab" id="ngFab" aria-label="Add node">+</button>
+  <div class="ng-viewer" id="ngViewer" hidden>
+    <img id="ngViewerImg" alt="">
+    <div class="ng-viewer-bar"><span id="ngViewerCap"></span><a class="btn" id="ngViewerDl" href="#" download>Download</a><button type="button" class="btn" id="ngViewerClose">Close</button></div>
+  </div>
+</section>
+
+<!-- CivitAI browser, full screen (the same browser moves between here and the Extra Networks tab) -->
+<div class="cv-full" id="cvFull" hidden role="dialog" aria-label="CivitAI browser">
+  <div class="cv-full-head">
+    <b>CivitAI</b><span class="cv-full-sub" id="cvFullSub"></span>
+    <span class="a-spacer"></span>
+    <button type="button" class="a-btn sm" id="cvDownloadsBtn">Downloads <span id="cvDlCount"></span></button>
+    <button type="button" class="a-x" id="cvFullClose" aria-label="Close">✕</button>
+  </div>
+  <div class="cv-host" id="cvHostFull"></div>
+</div>
+<div class="cv-detail" id="cvDetail" hidden role="dialog" aria-label="Model details"></div>
+<div class="cv-dl" id="cvDl" hidden role="dialog" aria-label="Downloads"></div>
+
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Image viewer">
+  <div class="lb-media" id="lbMedia">
+    <img id="lbImg" alt="">
+    <button type="button" class="lb-nav prev" id="lbPrev" aria-label="Previous"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button type="button" class="lb-nav next" id="lbNext" aria-label="Next"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+  </div>
+  <aside class="lb-info">
+    <div class="lb-head">
+      <span class="lb-index muted mono" id="lbIndex"></span>
+      <button type="button" class="icon-btn" id="lbClose" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+    <div class="lb-body" id="lbBody"></div>
+    <div class="lb-actions">
+      <button type="button" class="btn" id="lbReuse">Reuse settings</button>
+      <button type="button" class="btn" id="lbSeed">Use seed</button>
+      <a class="btn" id="lbDownload" href="#" download>Download</a>
+      <button type="button" class="btn danger" id="lbDelete">Delete</button>
+    </div>
+  </aside>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="app.js"></script>
+<script src="gen.js"></script>
+<script src="xnet.js"></script>
+<script src="tabs.js"></script>
+<script src="nodes.js"></script>
+<script src="extensions.js"></script>
+</body>
+</html>

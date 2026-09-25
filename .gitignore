@@ -1,0 +1,38 @@
+# models, renders and user data
+/models/
+/outputs/
+/inputs/
+/input/
+/logs/
+/config/
+/workflows/
+/ref/
+
+# CUDA toolkit redist (see README)
+/third_party/
+
+# build outputs
+/engine/build/
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+
+# benchmark scratch
+/bench/*_dump*/
+/bench/*_out*/
+/bench/detect_out/
+/bench/*.log
+
+# extensions: only the bundled example packs
+/extensions/*
+!/extensions/kiln-utils/
+!/extensions/kiln-image/
+!/extensions/kiln-upscale-to-size/
+
+# generated caches
+/server/tokenizers/clip/bpe_ranks.bin
+node_modules/
+__pycache__/
+*.pyc

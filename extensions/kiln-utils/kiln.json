@@ -1,0 +1,8 @@
+{
+  "name": "kiln-utils",
+  "version": "1.0.0",
+  "description": "Everyday utility nodes: Seed, text concatenate / join, int and float math, and a Switch that works with any type. A reference pack for porting ComfyUI nodes.",
+  "author": "Kiln",
+  "url": "",
+  "nodes": "nodes.js"
+}

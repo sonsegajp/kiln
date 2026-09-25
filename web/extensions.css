@@ -1,0 +1,89 @@
+/* ---------------------------------------------------------------- top-bar Extensions button */
+.pack-btn {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  padding: 5px 11px; border-radius: 999px; background: var(--raised); border: 1px solid var(--line);
+  font-size: 12px; color: var(--text-2); white-space: nowrap;
+}
+.pack-btn:hover { border-color: var(--line-2); color: var(--text); }
+.pack-btn svg { width: 15px; height: 15px; flex: none; }
+.pack-btn .pack-count { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.pack-btn .pack-count:empty { display: none; }
+.pack-btn.has-errors { border-color: rgba(255, 90, 110, .45); }
+.pack-btn.has-errors .pack-count { color: var(--bad); }
+@media (max-width: 900px) {
+  .pack-btn { padding: 5px 9px; }
+  .pack-btn .lbl { display: none; }
+}
+@media (max-width: 420px) {
+  .pack-btn { padding: 5px 7px; }
+  .pack-btn .pack-count:not(:empty) { display: none; }
+  .pack-btn.has-errors::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--bad); }
+}
+
+/* ---------------------------------------------------------------- panel */
+.xp { position: fixed; inset: 0; z-index: 180; background: rgba(6, 7, 9, .7); display: grid; place-items: center; padding: 20px; }
+.xp-panel {
+  width: min(860px, 100%); height: min(760px, calc(100dvh - 40px)); display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 14px; box-shadow: 0 30px 80px rgba(0, 0, 0, .6); overflow: hidden;
+}
+.xp-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.xp-titles { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.xp-title { font-size: 15px; }
+.xp-sub { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.xp-spacer { flex: 1; }
+.xp-btn {
+  height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0 11px; border-radius: 8px;
+  border: 1px solid var(--line-2); background: var(--raised); color: var(--text); font-size: 12.5px; font-weight: 600; white-space: nowrap;
+}
+.xp-btn:hover:not(:disabled) { background: var(--raised-2); }
+.xp-btn:disabled { opacity: .45; cursor: default; }
+.xp-btn.primary { background: linear-gradient(180deg, var(--accent-2), var(--accent)); color: var(--accent-ink); border-color: transparent; }
+.xp-btn.small { height: 27px; font-size: 12px; padding: 0 9px; }
+.xp-btn.danger { color: #ffb3bd; border-color: rgba(255, 90, 110, .35); }
+.xp-x { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text-2); }
+.xp-x:hover { color: var(--text); border-color: var(--line-2); }
+.xp-note { padding: 8px 14px; font-size: 12.5px; color: #ffd9a8; background: rgba(255, 193, 77, .08); border-bottom: 1px solid rgba(255, 193, 77, .25); }
+
+.xp-create { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 8px; align-items: end; padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.xp-field { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--muted); min-width: 0; }
+.xp-field input, .xp-src {
+  height: 32px; border-radius: 8px; border: 1px solid var(--line-2); background: var(--bg); color: var(--text); padding: 0 10px; min-width: 0; font-size: 13px;
+}
+.xp-field input:focus, .xp-src:focus { outline: none; border-color: var(--accent); }
+.xp-hint { grid-column: 1 / -1; margin: 0; font-size: 11.5px; color: var(--muted); }
+
+.xp-install { display: flex; gap: 8px; padding: 12px 14px 8px; }
+.xp-src { flex: 1; font-family: var(--mono); font-size: 12.5px; }
+.xp-busy { padding: 0 14px 6px; font-size: 12px; color: var(--accent-2); }
+.xp-busy::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 7px; border-radius: 50%; background: var(--accent); animation: pulse .8s infinite; }
+
+.xp-list { flex: 1; overflow-y: auto; padding: 2px 14px 12px; }
+.xp-empty { padding: 30px 6px; color: var(--text-2); font-size: 13px; text-align: center; }
+.xp-row { display: flex; gap: 12px; align-items: flex-start; padding: 12px 2px; border-bottom: 1px solid var(--line); }
+.xp-row.off .xp-main { opacity: .55; }
+.xp-main { flex: 1; min-width: 0; }
+.xp-name { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 13.5px; }
+.xp-ver, .xp-by { font-size: 11.5px; color: var(--muted); }
+.xp-ver { font-family: var(--mono); }
+.xp-tag { font-size: 10.5px; font-weight: 600; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--text-2); align-self: center; }
+.xp-tag.on { color: #9be8bf; border-color: rgba(70, 217, 138, .35); }
+.xp-tag.bad { color: #ffb3bd; border-color: rgba(255, 90, 110, .45); }
+.xp-desc { font-size: 12.5px; color: var(--text-2); margin-top: 4px; line-height: 1.45; }
+.xp-err { margin-top: 6px; font-size: 12px; font-family: var(--mono); color: #ffc2ca; background: rgba(255, 90, 110, .08); border: 1px solid rgba(255, 90, 110, .3); border-radius: 7px; padding: 5px 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.xp-nodes { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.xp-chip { font-size: 11.5px; padding: 2px 8px; border-radius: 6px; background: var(--raised); border: 1px solid var(--line); color: var(--text-2); }
+.xp-path { margin-top: 6px; font-size: 11px; color: var(--muted); font-family: var(--mono); overflow-wrap: anywhere; }
+.xp-path a { color: var(--text-2); }
+.xp-acts { display: flex; flex-direction: column; gap: 6px; flex: none; }
+.xp-foot { padding: 9px 14px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+
+@media (max-width: 700px) {
+  .xp { padding: 0; place-items: stretch; }
+  .xp-panel { width: 100%; height: 100dvh; border-radius: 0; border: 0; }
+  .xp-head { position: relative; padding-right: 54px; }
+  .xp-head .xp-x { position: absolute; top: 12px; right: 14px; }
+  .xp-create { grid-template-columns: 1fr; }
+  .xp-row { flex-direction: column; gap: 8px; }
+  .xp-acts { flex-direction: row; flex-wrap: wrap; }
+  .xp-src, .xp-field input { font-size: 16px; } /* no iOS zoom */
+}
