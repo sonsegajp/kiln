@@ -7,7 +7,8 @@ Its own C++/CUDA inference engine and web UI, built from scratch for cards like 
 
 Kiln runs diffusion models on its own engine instead of PyTorch. The kernels are written for GPUs
 without tensor cores: fp16x2 (HFMA2) GEMMs and implicit-GEMM convolutions, a fused flash attention,
-and weights kept in their checkpoint precision. On a laptop GTX 1660 Ti Max-Q (6 GB, power-capped),
+and weights kept in their checkpoint precision. On RTX cards, Kiln switches to its own tensor-core
+kernels at launch (new in 1.1, see [Tensor cores](#tensor-cores-rtx-cards)). On a laptop GTX 1660 Ti Max-Q (6 GB, power-capped),
 it renders the same seeds several times faster than PyTorch-based UIs.
 
 | Anima, 512x768, turbo LoRA, 8 steps | Time |
@@ -48,6 +49,8 @@ it, and run `setup.bat`. See [Install](#install).
   name, their look and, optionally, their usual outfit.
 - **Samplers and schedulers**: euler, euler ancestral, DPM++ 2M, res multistep and ER SDE, with every
   ComfyUI scheduler. The first-block step cache is optional.
+- **Tensor cores on RTX cards** (new, experimental): Kiln reads the GPU at launch and uses its own
+  tensor-core kernels on RTX 20/30/40/50 cards, with the fast fp16-accumulate mode that PyTorch doesn't use.
 - **Low-VRAM friendly**: weights that don't fit in VRAM stream from system RAM, VAE decodes are
   banded, and the scratch memory regrows automatically.
 - **Phones and tablets**: the web UI works on phones and tablets on the same Wi-Fi.
@@ -255,6 +258,7 @@ The server reads these environment variables. Set them in a terminal before runn
 | `KILN_EXT_LAN` | off | `1` allows managing packs from other devices |
 | `KILN_ENGINE` | `engine\build\kiln-engine.exe` | engine executable |
 | `KILN_SDXL` | off | `1` enables the unfinished SDXL path (slow) |
+| `KILN_TC` | auto | `0` or `1` forces the tensor-core kernels off or on (default: picked from the GPU at launch) |
 
 ## Updating
 
@@ -276,6 +280,8 @@ setup.bat
 - **"Port 8090 is in use."** Another program, or another Kiln, is using the port. Close it or set
   `KILN_PORT`.
 - **A download failed or was interrupted.** Run `setup.bat` again; it resumes.
+- **Images look wrong on an RTX card** (noise, stripes, black images). The tensor-core kernels are new;
+  set `KILN_TC=0` before `start.bat` to use the CUDA-core kernels, and please open an issue with your GPU.
 - **Something looks corrupted.** Run `setup.bat --verify`. Files that fail the check are downloaded again.
 - **The face detailer or the model upscaler is unavailable.** Its model is missing; run `setup.bat`
   (without `--no-extras`). The note under the option says what's missing.
@@ -489,6 +495,35 @@ that on these cards. Kiln's kernels are built around it.
   - the NAG combine;
   - Lanczos-3 resampling;
   - latent normalization.
+
+#### Tensor cores (RTX cards)
+
+New in 1.1 and still experimental: the kernels below are verified for accuracy, but their speed hasn't been
+benchmarked on RTX hardware yet.
+
+- **Picked at launch** (`pick_kernels` in `kernels.cu`): the engine reads the GPU. Ampere and newer (RTX
+  30/40/50, sm_80+) use tensor cores. Turing is ambiguous, because RTX 20xx has tensor cores and GTX 16xx
+  doesn't, but both are sm_75. So the two GEMMs race on a DiT-sized product and the faster one wins. The
+  choice is logged at startup (`GPU: … tensor-core kernels ON`), and `KILN_TC=0/1` overrides it.
+- **GEMM** (`tcgemm.cuh`): `mma.sync` with 128×128×32 block tiles, 8 warps of 64×32, `ldmatrix` from
+  padded shared rows, double-buffered. The fp32 activations and bf16 weights are rounded to fp16 while
+  being staged.
+  - **The accumulation trick**: GeForce tensor cores run with an fp16 accumulator at *twice* the rate of
+    an fp32 accumulator (e.g. RTX 4090: 165 vs 83 dense TFLOPS). PyTorch always uses the fp32 accumulator.
+    Kiln accumulates each 32-deep k tile in fp16 and flushes it into fp32 totals, the same scheme as the
+    HFMA2 kernels. That keeps the fast rate without the accuracy loss of accumulating K = 8192 products in
+    fp16.
+  - Measured error against fp32: 3.9×10⁻⁴ (the HFMA2 GEMM: 8.7×10⁻⁴).
+- **Attention** (`tcflash.cuh`), FlashAttention-2 style:
+  - Each warp owns 16 query rows and keeps its Q fragments and softmax statistics in registers.
+  - QKᵀ accumulates in fp32. P goes straight from the softmax into the PV mma, because the score layout
+    of two key tiles is the A-fragment layout of one k16 step. PV accumulates in fp16 per 32 keys.
+  - V is read through `ldmatrix.trans`, and padding keys are handled analytically.
+  - Measured error: 6.9×10⁻⁴ (the HFMA2 attention: 1.8×10⁻³).
+- **Build**: the engine is compiled for sm_75, sm_80, sm_89 and sm_120, plus compute_80 PTX that other
+  GPUs compile on first start.
+- **Still on the CUDA cores on RTX cards**: the VAE, upscaler and face-detector convolutions.
+- **Tests**: `bench/tc_probe.cu`, `bench/tc_test.cu` and `bench/tfa_test.cu`.
 
 Every kernel runs on one CUDA stream. `--fp32` (or `"precision":"fp32"` in a request) switches every GEMM
 and attention to exact fp32 cuBLAS. That is the reference path the fast path is measured against.

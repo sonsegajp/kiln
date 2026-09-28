@@ -3,7 +3,8 @@
 // UI, engine source, tools, bundled extension packs, docs), the prebuilt engine and its CUDA runtime DLL,
 // and setup.bat, which downloads the rest (portable Node if needed, NVIDIA's cuBLAS, the models).
 // Never included: config\ (API keys and local settings), models, outputs, logs.
-//   node tools\make-dist.js
+//   node tools\make-dist.js [--engine-dir engineuild
+ext]
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -17,9 +18,17 @@ const SKIP = [/^\.git/, /^local\//, /^bench\//, /^dist\//, /^server\/tests\//, /
 const files = [...new Set([...git('ls-files'), ...git('ls-files', '--others', '--exclude-standard')])]
   .filter((f) => fs.existsSync(path.join(ROOT, f)) && !SKIP.some((re) => re.test(f)));
 // the prebuilt engine: nobody should need Visual Studio to run Kiln
-const ENGINE = ['engine/build/kiln-engine.exe', 'engine/build/cudart64_13.dll'];
-for (const f of ENGINE) if (!fs.existsSync(path.join(ROOT, f))) throw new Error('missing ' + f + ' (build the engine first)');
-files.push(...ENGINE);
+// (--engine-dir: take it from another folder, e.g. a new build in engineuild
+ext while the old one runs)
+const ai = process.argv.indexOf('--engine-dir');
+const ENGINE_DIR = path.resolve(ROOT, ai > 0 && process.argv[ai + 1] ? process.argv[ai + 1] : 'engine/build');
+const ENGINE = ['kiln-engine.exe', 'cudart64_13.dll'];
+const source = {};
+for (const f of ENGINE) {
+  if (!fs.existsSync(path.join(ENGINE_DIR, f))) throw new Error('missing ' + path.join(ENGINE_DIR, f) + ' (build the engine first)');
+  source['engine/build/' + f] = path.join(ENGINE_DIR, f);
+  files.push('engine/build/' + f);
+}
 
 // nothing personal goes out: the CivitAI key and any config file must not be in the list or the files
 const secrets = [];
@@ -39,7 +48,7 @@ fs.rmSync(stage, { recursive: true, force: true });
 for (const f of files) {
   const dst = path.join(stage, 'Kiln', ...f.split('/'));
   fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, f), dst);
+  fs.copyFileSync(source[f] || path.join(ROOT, f), dst);
 }
 fs.writeFileSync(path.join(stage, 'Kiln', 'START HERE.txt'), [
   'Kiln - an image generator for the Anima model that runs on your own PC.',
