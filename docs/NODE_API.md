@@ -9,9 +9,10 @@ server, and call back into the engine for GPU work.
 
 ```
 Kiln/extensions/<pack>/
-  kiln.json    {"name", "version", "description", "author", "url", "nodes": "nodes.js", "ui": "ui.js"}
-  nodes.js     CommonJS module (below)
+  kiln.json    {"name", "version", "description", "author", "url", "nodes": "nodes.js", "ui": "ui.js", "page": "page.js"}
+  nodes.js     CommonJS module (below); leave it out (or "nodes": false) for a pack with only a page module
   ui.js        optional: custom widgets for Kiln's editor
+  page.js      optional: panels for the txt2img page and a hook on its Generate button (see "Page")
 ```
 
 ```js
@@ -189,3 +190,37 @@ editor. Reloading packs re-imports ui.js and re-renders the nodes that use its w
 Reference packs: `extensions/kiln-utils` (Seed, Concatenate, Text Join, Int/Float Math, Switch), `extensions/kiln-image`
 (Image Adjust with a slider widget from its ui.js; ports of ComfyUI's ImageFlip, ImageRotate, ImageCrop) and
 `extensions/kiln-upscale-to-size` (ctx.ops.upscale + ctx.ops.resize).
+
+## Page (txt2img panels)
+
+A pack's optional `page.js` (named by `"page"` in kiln.json) is loaded into the Simple mode page as an ES module, at
+startup and again whenever packs change. It default-exports a setup function that receives `kiln`:
+
+```js
+export default function setup(kiln) {
+  const panel = kiln.addPanel({ title: 'Styles', before: 'accChar' });  // a collapsible panel in txt2img
+  const box = kiln.el('textarea');
+  box.value = kiln.store.get('styles', '');
+  box.addEventListener('input', () => kiln.store.set('styles', box.value));
+  panel.body.appendChild(box);
+  // one set of images per line of the box, all with the same seed
+  kiln.onGenerate((req) => {
+    const lines = box.value.split('\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return;                                         // unchanged
+    return { ...req, variants: lines.map(l => `${req.prompt}, ${l}`) };
+  });
+}
+```
+
+| `kiln.` | |
+|---|---|
+| `addPanel({title, before, open})` | a panel like Characters or Face Detailer, placed before the element with id `before` (default `accChar`). Returns `{root, body, summary(text)}`. Removed when packs reload. |
+| `onGenerate(fn)` | `fn(request, {tab})` runs when txt2img's Generate is pressed, before the request goes to `POST /api/generate`. Return nothing (unchanged), a new request object, or `false` to cancel; throw to cancel with a message. |
+| `prompt.get()`, `prompt.set(text)`, `prompt.insert(words)` | read or change the prompt box (`insert` appends words that aren't there yet). `negative.get()`. |
+| `store.get(key, default)`, `store.set(key, value)` | per-browser storage for the pack's own settings. |
+| `css(text)`, `url(rel)`, `el(tag, class, text)`, `toast(msg, kind)`, `api(path, opts)`, `version`, `pack` | as in the editor UI. |
+
+**Prompt variants.** A request may carry `variants`: up to 32 prompts, rendered as one group (`variants × batch`
+images, at most 256). By default every variant uses the same seeds (`variant_seeds: "same"`), so only the prompt
+changes between them; `"different"` gives each its own. `<lora:name:weight>` tags inside a variant apply to that
+variant only.

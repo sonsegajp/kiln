@@ -344,14 +344,31 @@ function validateRequest(b) {
     if (i >= 0) loras[i].strength = strength; else loras.push({ file: m.file, strength, path: m.path });
   }
   // A1111 <lora:name:weight> in the prompt: added to the slots (a tag overrides a slot of the same LoRA)
+  const slotLoras = loras.map(l => ({ ...l }));
+  const withTags = (list, conv) => {
+    for (const t of conv.tags) {
+      const m = resolveLora(models, t.name);
+      if (!m) { if (!tagDropped.some(d => d.startsWith(`<lora:${t.name}>`))) tagDropped.push(`<lora:${t.name}> (no LoRA with that name)`); continue; }
+      const strength = Math.max(-4, Math.min(4, t.weight));
+      const i = list.findIndex(x => x.file === m.file);
+      if (i >= 0) { if (strength === 0) list.splice(i, 1); else list[i].strength = strength; }
+      else if (strength !== 0) list.push({ file: m.file, strength, path: m.path });
+    }
+    return list;
+  };
   const conv = A.toKilnPrompt(typeof b.prompt === 'string' ? b.prompt : '');
-  for (const t of conv.tags) {
-    const m = resolveLora(models, t.name);
-    if (!m) { tagDropped.push(`<lora:${t.name}> (no LoRA with that name)`); continue; }
-    const strength = Math.max(-4, Math.min(4, t.weight));
-    const i = loras.findIndex(x => x.file === m.file);
-    if (i >= 0) { if (strength === 0) loras.splice(i, 1); else loras[i].strength = strength; }
-    else if (strength !== 0) loras.push({ file: m.file, strength, path: m.path });
+  withTags(loras, conv);
+  // prompt variants (packs such as outfit lists): one set of images per prompt, in one group; each variant's
+  // own <lora:> tags apply to it alone
+  let variants = null;
+  if (Array.isArray(b.variants) && b.variants.length) {
+    if (b.variants.length > 32) throw new Error('at most 32 prompt variants');
+    variants = b.variants.map((v) => {
+      const text = typeof v === 'string' ? v : v && typeof v.prompt === 'string' ? v.prompt : null;
+      if (text == null) throw new Error('prompt variants must be strings');
+      const c = A.toKilnPrompt(text);
+      return { prompt: text, promptText: c.text, loras: withTags(slotLoras.map(l => ({ ...l })), c) };
+    });
   }
   const sdxl = !!model && model.family === 'sdxl';
   if (model && !sdxl) {
@@ -396,10 +413,14 @@ function validateRequest(b) {
     // what gets tokenized: <lora:> tags removed, A1111 [de-emphasis] -> (text:0.9091)
     promptText: conv.text,
     negativeText: A.deemphasize(A.extractLoraTags(typeof b.negative === 'string' ? b.negative : '').text),
+    variants,
+    // variants share one seed (only the prompt changes between them); 'different' gives each its own
+    variant_seeds: b.variant_seeds === 'different' ? 'different' : 'same',
     warnings,
     ...enh,
     dropped: [...tagDropped, ...enh.dropped],
   };
+  if (variants && variants.length * ret.batch > 256) throw new Error(`${variants.length * ret.batch} images in one go is too many (at most 256)`);
   if (sdxl) {
     const p = ret;
     p.family = 'sdxl';
@@ -477,36 +498,45 @@ function validateEnhance(b, width, height) {
 function createJobs(p) {
   const group = 'g' + (++groupSeq);
   const sdxl = p.family === 'sdxl';
-  const posText = p.promptText != null ? p.promptText : p.prompt;
   const negText = p.negativeText != null ? p.negativeText : p.negative;
-  const qwen = sdxl ? null : encodePrompt(posText);
   const neg = !sdxl && (p.cfg > 1 || (p.nag && negText.trim())) ? encodePrompt(negText) : null;
-  const sd = sdxl ? { pos: encodeSDXL(posText), neg: encodeSDXL(negText) } : null;
+  const variants = p.variants || [{ prompt: p.prompt, promptText: p.promptText, loras: p.loras }];
+  // with several variants and a random seed, one random base seed is shared so they stay comparable
+  const base = variants.length > 1 && p.seed < 0 && p.variant_seeds === 'same' ? randomSeed() : p.seed;
   const created = Date.now();
   const out = [];
-  for (let i = 0; i < p.batch; i++) {
-    const seed = p.seed < 0 ? randomSeed() : Math.min(9007199254740991, p.seed + i);
-    const j = {
-      id: 'j' + (++jobSeq), group, index: i, count: p.batch, status: 'queued', created,
-      params: {
-        prompt: p.prompt, negative: p.negative, width: p.width, height: p.height, steps: p.steps,
-        cfg: p.cfg, cfg_cutoff: p.cfg_cutoff, step_cache: p.step_cache, nag: p.nag, seed, sampler: p.sampler, shift: p.shift,
-        loras: p.loras.map(l => ({ file: l.file, strength: l.strength })),
-        model: p.model,
-        family: sdxl ? 'sdxl' : undefined,
-        scheduler: sdxl ? p.scheduler : undefined,
-      },
-      loraPaths: p.loras.map(l => ({ file: l.path, strength: l.strength })),
-      enc: qwen, neg, sd, family: sdxl ? 'sdxl' : 'anima', checkpoint: sdxl ? p.checkpointPath : null, dit: sdxl ? null : p.ditPath || null,
-      step: 0, of: p.steps, stepMs: [], stage: 'base', timeline: [],
-    };
-    // post-processing options live in params (so they land in the PNG's kiln tEXt)
-    if (p.hires) j.params.hires = { ...p.hires };
-    if (p.face) j.params.face = { ...p.face };
-    if (p.upscale) j.params.upscale = { ...p.upscale };
-    jobs.set(j.id, j);
-    queue.push(j);
-    out.push(j);
+  const count = variants.length * p.batch;
+  if (count > 256) throw new Error(`${count} images in one go is too many (at most 256)`);
+  for (let v = 0; v < variants.length; v++) {
+    const V = variants[v];
+    const posText = V.promptText != null ? V.promptText : V.prompt;
+    const qwen = sdxl ? null : encodePrompt(posText);
+    const sd = sdxl ? { pos: encodeSDXL(posText), neg: encodeSDXL(negText) } : null;
+    const loras = sdxl ? [] : V.loras;
+    for (let i = 0; i < p.batch; i++) {
+      const seed = base < 0 ? randomSeed() : Math.min(9007199254740991, base + i + (p.variant_seeds === 'different' ? v * p.batch : 0));
+      const j = {
+        id: 'j' + (++jobSeq), group, index: v * p.batch + i, count, status: 'queued', created,
+        params: {
+          prompt: V.prompt, negative: p.negative, width: p.width, height: p.height, steps: p.steps,
+          cfg: p.cfg, cfg_cutoff: p.cfg_cutoff, step_cache: p.step_cache, nag: p.nag, seed, sampler: p.sampler, shift: p.shift,
+          loras: loras.map(l => ({ file: l.file, strength: l.strength })),
+          model: p.model,
+          family: sdxl ? 'sdxl' : undefined,
+          scheduler: sdxl ? p.scheduler : undefined,
+        },
+        loraPaths: loras.map(l => ({ file: l.path, strength: l.strength })),
+        enc: qwen, neg, sd, family: sdxl ? 'sdxl' : 'anima', checkpoint: sdxl ? p.checkpointPath : null, dit: sdxl ? null : p.ditPath || null,
+        step: 0, of: p.steps, stepMs: [], stage: 'base', timeline: [],
+      };
+      // post-processing options live in params (so they land in the PNG's kiln tEXt)
+      if (p.hires) j.params.hires = { ...p.hires };
+      if (p.face) j.params.face = { ...p.face };
+      if (p.upscale) j.params.upscale = { ...p.upscale };
+      jobs.set(j.id, j);
+      queue.push(j);
+      out.push(j);
+    }
   }
   // keep memory bounded
   if (jobs.size > 500) {

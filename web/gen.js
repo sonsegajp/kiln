@@ -692,8 +692,10 @@
 
   // ---------------------------------------------------------------- generate (txt2img / img2img)
   const BUSY = { groups: new Set(), graphJobs: new Set() };
+  const PX = { gen: 0, panels: [], styles: [], hooks: [], busy: false };  // pack page modules (below)
   async function generate() {
     if ($('generateBtn').disabled) { toast($('generateBtn').title, 'err', 4000); return; }
+    if (PX.busy) return;
     const gen = $('generateBtn');
     gen.classList.remove('flash'); void gen.offsetWidth; gen.classList.add('flash');
     if (tab() === 'img2img') return generateI2i();
@@ -713,8 +715,19 @@
     if (G.hires.on && hiresScale() > 1.001) body.hires = { scale: Math.round(hiresScale() * 1000) / 1000, denoise: G.hires.denoise, steps: G.hires.steps, upscaler: G.hires.upscaler === 'model' && (!f || f.upscale_model) ? 'model' : 'lanczos' };
     if (!sd && G.face.on && (!f || f.face)) body.face = { enabled: true, denoise: G.face.denoise, steps: G.face.steps, guide: G.face.guide, max_size: G.face.max_size, crop: G.face.crop, conf: G.face.conf, max_faces: G.face.max_faces };
     if (G.upscale) body.upscale = { factor: G.upscale };
+    // packs may change the request (e.g. turn it into prompt variants) or stop it
+    let req = body;
+    PX.busy = true;
     try {
-      const r = await api('/api/generate', { method: 'POST', body });
+      for (const h of PX.hooks) {
+        const r = await h.fn(req, { tab: 'txt2img' });
+        if (r === false) return;
+        if (r && typeof r === 'object') req = r;
+      }
+    } catch (e) { toast(`Generate: ${e.message}`, 'err', 6000); return; }
+    finally { PX.busy = false; }
+    try {
+      const r = await api('/api/generate', { method: 'POST', body: req });
       BUSY.groups.add(r.group);
       outBegin({ group: r.group, ids: r.ids, kind: 'txt2img' });
       // the job may already be running (its SSE event came before this response): start the stage now,
@@ -1615,6 +1628,70 @@
 
   $('toolNets').addEventListener('click', () => { G.xnetOpen = !G.xnetOpen; save(); K.emit('xnet', { open: G.xnetOpen }); });
 
+  // ---------------------------------------------------------------- pack page modules ("page" in kiln.json)
+  // A pack's page module adds panels to txt2img and can change what Generate sends (docs/NODE_API.md, "Page").
+  function setPrompt(t) { promptEl.value = t; G.prompt = t; autoGrow(promptEl, 76); save(); tokPos(); renderSlotWarn(); promptChanged(); }
+  function pageApi(p) {
+    const key = (k) => `kiln.pack.${p.dir}.${k}`;
+    return {
+      version: 1, pack: p.name,
+      css(text) { const t = document.createElement('style'); t.textContent = String(text); document.head.appendChild(t); PX.styles.push(t); return t; },
+      url: (rel) => `/extensions/${encodeURIComponent(p.dir)}/${String(rel).replace(/^\/+/, '')}`,
+      toast: (msg, kind, ms) => toast(String(msg), kind, ms),
+      api: (path, opts) => api(path, opts),
+      el,
+      // a collapsible panel like Characters / Face Detailer, placed before the element with id `before`
+      addPanel({ title, before, open } = {}) {
+        const d = el('details', 'a-acc');
+        d.dataset.only = 'txt2img';
+        d.dataset.pack = p.dir;
+        if (open) d.open = true;
+        const sum = el('span', 'a-acc-sum');
+        const s = el('summary');
+        s.append(el('span', 'a-acc-title', String(title || p.name)), sum);
+        const body = el('div', 'a-acc-body');
+        d.append(s, body);
+        const ref = (before && document.getElementById(before)) || $('accChar');
+        ref.parentNode.insertBefore(d, ref);
+        PX.panels.push(d);
+        applyTab();
+        return { root: d, body, summary(text) { sum.textContent = text || ''; } };
+      },
+      prompt: { get: () => G.prompt, set: (t) => setPrompt(String(t)), insert: (words) => insertText([].concat(words).map(String)) },
+      negative: { get: () => G.negative },
+      // fn(request, {tab}) before txt2img's Generate posts to /api/generate: return nothing (unchanged), a new
+      // request object (e.g. with `variants`), or false to cancel; throw to cancel with a message
+      onGenerate(fn) { if (typeof fn === 'function') PX.hooks.push({ pack: p.name, fn }); },
+      // per-browser storage for the pack's own settings
+      store: {
+        get(k, def) { try { const v = localStorage.getItem(key(k)); return v == null ? def : JSON.parse(v); } catch (_) { return def; } },
+        set(k, v) { try { localStorage.setItem(key(k), JSON.stringify(v)); } catch (_) { } },
+      },
+    };
+  }
+  async function loadPackPages() {
+    let d;
+    try { d = await api('/api/extensions'); } catch (_) { return; }
+    const gen = ++PX.gen;
+    for (const x of PX.panels.splice(0)) x.remove();
+    for (const x of PX.styles.splice(0)) x.remove();
+    PX.hooks.length = 0;
+    for (const p of d.packs || []) {
+      if (!p.loaded || !p.enabled || !p.page) continue;
+      try {
+        const mod = await import(`/extensions/${encodeURIComponent(p.dir)}/${p.page.split('/').map(encodeURIComponent).join('/')}?v=${d.summary.gen}`);
+        if (gen !== PX.gen) return;
+        const setup = typeof mod.default === 'function' ? mod.default : typeof mod.setup === 'function' ? mod.setup : null;
+        if (!setup) throw new Error('the page module must export a default function (or "setup")');
+        await setup(pageApi(p));
+      } catch (e) {
+        console.warn(`[kiln] pack ${p.name}: page module failed:`, e);
+        toast(`Pack ${p.name}: ${e.message}`, 'err', 6000);
+      }
+    }
+  }
+  window.addEventListener('kiln:sse', (e) => { if (e.detail.type === 'extensions') loadPackPages(); });
+
   window.KilnGen = {
     get G() { return G; }, get family() { return FAM; }, applyParams, a1111ToParams, parseInfotext, infotext, toggleLoraTag, insertText, addToSlot, setI2iImage,
     generate, extractLoraTags, deemphasize, mismatch, renderWarn, loadGallery, stem,
@@ -1626,5 +1703,6 @@
   applyTab();
   loadInfo();
   loadGallery(true);
+  loadPackPages();
   requestAnimationFrame(fitFrame);
 })();

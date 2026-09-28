@@ -204,13 +204,18 @@ class Packs {
     const other = this.packs.find(x => x.name === p.name && x.loaded);
     if (other) { p.error = `another pack (folder "${other.dir}") is already called "${p.name}"`; return p; }
     if (!p.enabled) return p;
-    const nodesFile = inside(full, meta.nodes == null ? 'nodes.js' : meta.nodes);
-    if (!nodesFile) { p.error = 'kiln.json: "nodes" must be a file inside the pack'; return p; }
-    if (!exists(nodesFile)) { p.error = `${path.relative(full, nodesFile).replace(/\\/g, '/')} is missing`; return p; }
-    let mod;
-    try { mod = require(nodesFile); } catch (e) { p.error = loadError(e, full); this.forget(full); return p; }
-    const defs = mod && (mod.nodes || (mod.default && mod.default.nodes));
-    if (!defs || typeof defs !== 'object' || Array.isArray(defs)) { p.error = 'nodes.js must export { nodes: { ClassName: {...} } }'; return p; }
+    // a pack with only a "page" module needs no nodes.js
+    const pageOnly = meta.nodes === false || (meta.nodes == null && meta.page != null && !exists(path.join(full, 'nodes.js')));
+    let defs = {};
+    if (!pageOnly) {
+      const nodesFile = inside(full, meta.nodes == null ? 'nodes.js' : meta.nodes);
+      if (!nodesFile) { p.error = 'kiln.json: "nodes" must be a file inside the pack'; return p; }
+      if (!exists(nodesFile)) { p.error = `${path.relative(full, nodesFile).replace(/\\/g, '/')} is missing`; return p; }
+      let mod;
+      try { mod = require(nodesFile); } catch (e) { p.error = loadError(e, full); this.forget(full); return p; }
+      defs = mod && (mod.nodes || (mod.default && mod.default.nodes));
+      if (!defs || typeof defs !== 'object' || Array.isArray(defs)) { p.error = 'nodes.js must export { nodes: { ClassName: {...} } }'; return p; }
+    }
     for (const [cls, def] of Object.entries(defs)) {
       try {
         if (builtin[cls]) throw new Error('a built-in Kiln node already has this name');
@@ -226,6 +231,13 @@ class Packs {
       if (!ui || !/\.m?js$/i.test(ui)) p.node_errors['(ui)'] = 'kiln.json: "ui" must be a .js file inside the pack';
       else if (!exists(ui)) p.node_errors['(ui)'] = `${meta.ui} is missing`;
       else p.ui = path.relative(full, ui).replace(/\\/g, '/');
+    }
+    // "page": a module loaded into the txt2img page (panels + a hook on Generate), like "ui" for the editor
+    if (meta.page != null) {
+      const pg = inside(full, meta.page);
+      if (!pg || !/\.m?js$/i.test(pg)) p.node_errors['(page)'] = 'kiln.json: "page" must be a .js file inside the pack';
+      else if (!exists(pg)) p.node_errors['(page)'] = `${meta.page} is missing`;
+      else p.page = path.relative(full, pg).replace(/\\/g, '/');
     }
     p.loaded = true;
     p.load_ms = Date.now() - t0;
@@ -248,7 +260,7 @@ class Packs {
   list() {
     return this.packs.map(p => ({
       dir: p.dir, name: p.name, version: p.version, description: p.description, author: p.author, url: p.url,
-      enabled: p.enabled, loaded: p.loaded, error: p.error, node_errors: p.node_errors, nodes: p.nodes, ui: p.ui,
+      enabled: p.enabled, loaded: p.loaded, error: p.error, node_errors: p.node_errors, nodes: p.nodes, ui: p.ui, page: p.page,
       git: p.git, path: p.path, load_ms: p.load_ms,
     }));
   }
