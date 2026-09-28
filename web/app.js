@@ -87,7 +87,8 @@
     if (!S.connected) { pill.dataset.state = 'offline'; label.textContent = 'Server offline · retrying'; return; }
     const e = S.engine || {};
     let state = e.state, text;
-    if (state === 'ready') {
+    if (state === 'ready' && e.gpu_wait) { state = 'parked'; text = `Waiting for ${e.gpu_wait} to finish with the GPU`; }
+    else if (state === 'ready') {
       if (S.running) { state = 'busy'; text = e.mock ? 'Rendering (mock)' : 'Rendering'; }
       else { state = e.mock ? 'mock' : 'ready'; text = e.mock ? 'Mock engine' : 'Engine ready'; }
     } else if (state === 'starting') {
@@ -252,11 +253,22 @@
   }
 
   // ---------------------------------------------------------------- server events
+  let es = null, hiddenAt = 0, retry = null, lastMsg = Date.now(), lastResync = 0;
   function connect() {
-    const es = new EventSource('/api/events');
-    es.onopen = () => { S.connected = true; renderEngine(); };
-    es.onerror = () => { S.connected = false; renderEngine(); };
+    if (es) { try { es.close(); } catch (_) { } }
+    clearTimeout(retry);
+    es = new EventSource('/api/events');
+    lastMsg = Date.now();
+    es.addEventListener('ping', () => { lastMsg = Date.now(); });
+    es.onopen = () => { S.connected = true; lastMsg = Date.now(); renderEngine(); };
+    es.onerror = () => {
+      S.connected = false;
+      renderEngine();
+      // the browser gives up for good after an HTTP error (a reverse proxy answers 502 while Kiln restarts)
+      if (es.readyState === EventSource.CLOSED) retry = setTimeout(connect, 3000);
+    };
     es.onmessage = (e) => {
+      lastMsg = Date.now();
       let m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m.type === 'job') mergeJob(m.job);
@@ -280,6 +292,40 @@
       }
     };
   }
+
+  // Back from the background (phones suspend the page and drop the event stream): reconnect, catch up on
+  // jobs that finished or moved on while away, and let the tabs reload what they show.
+  async function resync() {
+    if (Date.now() - lastResync < 2000) return;  // several signals fire for one wake-up
+    lastResync = Date.now();
+    connect();
+    try { applyQueue(await api('/api/queue')); } catch (_) { }
+    const open = [...S.jobs.values()].filter((j) => j.status === 'running' || j.status === 'queued');
+    for (const j of open) {
+      try {
+        const fresh = await api('/api/job/' + encodeURIComponent(j.id));
+        mergeJob(fresh);
+        window.dispatchEvent(new CustomEvent('kiln:sse', { detail: { type: 'job', job: fresh } }));
+      } catch (_) { /* gone from the server: the queue snapshot on reconnect settles it */ }
+    }
+    emit('resume');
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 2000) { hiddenAt = 0; resync(); }
+  });
+  window.addEventListener('pageshow', (e) => { if (e.persisted) resync(); });
+  window.addEventListener('online', () => resync());
+  window.addEventListener('kiln:resume', () => resync());   // a wrapper app (WebView), on coming back to the front
+  document.addEventListener('resume', () => resync());      // page lifecycle: unfrozen
+  // A frozen page runs no timers: a tick that arrives far too late means we were frozen. And a stream that
+  // has gone quiet past two server pings is dead even if the browser hasn't noticed yet.
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    if (now - lastTick > 10000 || (S.connected && now - lastMsg > 40000)) resync();
+    lastTick = now;
+  }, 3000);
 
   // Ctrl+Enter: generate in the current tab (Nodes queues its graph)
   document.addEventListener('keydown', (e) => {

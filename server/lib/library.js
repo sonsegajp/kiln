@@ -261,11 +261,16 @@ function createLibrary(ctx) {
       let mm = rest.match(/^model\/(\d{1,12})$/);
       if (mm && m === 'GET') { sendJSON(res, 200, annotate(await civitai.model(mm[1]))); return true; }
       if (rest === 'downloads' && m === 'GET') { sendJSON(res, 200, { downloads: civitai.publicDownloads(), hasher: hasher.status() }); return true; }
-      // everything below writes to disk / uses the key: this PC only
-      const why = manageDenied(req);
-      if (why) { sendJSON(res, 403, { error: why }); return true; }
       const b = m === 'POST' ? await readJSON(req) : {};
-      if (rest === 'settings' && m === 'POST') { sendJSON(res, 200, Object.assign(civitai.setSettings(b), { manage: true })); broadcast({ type: 'settings' }); return true; }
+      // the key and the settings: this PC only. Downloads work from any device that got in (phones on the
+      // Wi-Fi, or through a password-protected reverse proxy); the key never leaves the server.
+      if (rest === 'settings' && m === 'POST') {
+        const why = manageDenied(req);
+        if (why) { sendJSON(res, 403, { error: 'changing CivitAI settings is only allowed on the PC running Kiln' }); return true; }
+        sendJSON(res, 200, Object.assign(civitai.setSettings(b), { manage: true }));
+        broadcast({ type: 'settings' });
+        return true;
+      }
       if (rest === 'download' && m === 'POST') {
         const d = await civitai.enqueue(b.versionId, b.fileId);
         sendJSON(res, 200, { download: civitai.publicDownloads().find(x => x.id === d.id) });

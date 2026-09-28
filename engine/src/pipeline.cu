@@ -137,7 +137,7 @@ bool known_scheduler(const std::string& n) {
     for (auto s : SCHEDULERS) if (n == s) return true;
     return false;
 }
-bool known_sampler(const std::string& n) { return n == "euler" || n == "euler_ancestral" || n == "dpmpp_2m" || n == "res_multistep"; }
+bool known_sampler(const std::string& n) { return n == "euler" || n == "euler_ancestral" || n == "dpmpp_2m" || n == "res_multistep" || n == "er_sde"; }
 
 // The model's sigma space: the sigmas of its 1000 timesteps (ascending) and the timestep <-> sigma maps
 // the schedulers use. Flow (ModelSamplingDiscreteFlow): timestep = sigma (the multiplier cancels),
@@ -336,6 +336,60 @@ __global__ void k_update(float* x, const float* den, const float* old, float a, 
     if (i < n) x[i] = a * x[i] + b * den[i] + (old ? c * old[i] : 0.f);
 }
 
+// ER-SDE (Extended Reverse-Time SDE solver, VE ER-SDE-Solver-3, arXiv 2309.06169), ComfyUI's er_sde for flow
+// models: lambda = sigma / (1 - sigma), alpha = 1 - sigma, noise scaler f(l) = l * (exp(l^0.3) + 10).
+//   x = a*x + b*den                                       (stage 1)
+//   + c2 * dd,  dd = (den - old) * inv2                   (stage 2, from the 2nd step)
+//   + c3 * (dd - oldd) * inv3                             (stage 3, from the 3rd step); oldd <- dd
+//   + cn * noise
+__global__ void k_ersde(float* x, const float* den, const float* old, float* oldd, const float* noise,
+                        float a, float b, float c2, float inv2, float c3, float inv3, float cn, int stage, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float d = den[i];
+    float v = a * x[i] + b * d;
+    if (stage >= 2) {
+        float dd = (d - old[i]) * inv2;
+        v += c2 * dd;
+        if (stage >= 3) v += c3 * (dd - oldd[i]) * inv3;
+        oldd[i] = dd;
+    }
+    if (noise) v += cn * noise[i];
+    x[i] = v;
+}
+
+struct ErSdeCoef { float a, b, c2, inv2, c3, inv3, cn; int stage; };
+static ErSdeCoef ersde_coef(const std::vector<float>& sig, int i) {
+    auto lam = [&](int k) { double s = sig[k]; return s / (1.0 - s); };
+    auto f = [](double l) { return l * (std::exp(std::pow(l, 0.3)) + 10.0); };
+    const double ls = lam(i), lt = lam(i + 1);
+    const double as = sig[i] / ls, at = sig[i + 1] / lt;  // = 1 - sigma
+    const double r = f(lt) / f(ls), ra = at / as;
+    ErSdeCoef c{};
+    c.stage = std::min(3, i + 1);
+    c.a = (float)(ra * r);
+    c.b = (float)(at * (1.0 - r));
+    if (c.stage >= 2) {
+        const double dt = lt - ls, step = -dt / 200.0;
+        double S = 0.0, Su = 0.0;
+        for (int k = 0; k < 200; k++) {
+            double lp = lt + k * step, fp = f(lp);
+            S += 1.0 / fp;
+            Su += (lp - ls) / fp;
+        }
+        S *= step;
+        Su *= step;
+        c.c2 = (float)(at * (dt + S * f(lt)));
+        c.inv2 = (float)(1.0 / (ls - lam(i - 1)));
+        if (c.stage >= 3) {
+            c.c3 = (float)(at * (dt * dt / 2.0 + Su * f(lt)));
+            c.inv3 = (float)(2.0 / (ls - lam(i - 2)));
+        }
+    }
+    c.cn = (float)(at * std::sqrt(std::max(0.0, lt * lt - ls * ls * r * r)));
+    return c;
+}
+
 // Coefficients of ComfyUI's k-diffusion samplers (deterministic variants), in their own
 // parameterization: t = -log(sigma), h = t_next - t.
 struct StepCoef { float a, b, c; };
@@ -405,7 +459,9 @@ void sample(Dit& dit, float* x, int Hl, int Wl, const Context& pos, const Contex
         float* old = G.arena.f(n);
         bool have_old = false;
         if (!known_sampler(sp.sampler)) throw std::runtime_error("unknown sampler " + sp.sampler);
-        float* anoise = sp.sampler == "euler_ancestral" ? G.arena.f(n) : nullptr;
+        const bool ersde = sp.sampler == "er_sde";
+        float* anoise = sp.sampler == "euler_ancestral" || ersde ? G.arena.f(n) : nullptr;
+        float* oldd = ersde ? G.arena.f(n) : nullptr;  // er_sde: the previous step's first difference
 
         // first-block cache: never in the first 15% or last 10% of steps, at most 2 skips in a row
         Dit::StepCache sc;
@@ -423,6 +479,7 @@ void sample(Dit& dit, float* x, int Hl, int Wl, const Context& pos, const Contex
         int tail = std::max(1, (int)std::ceil((1.f - sp.cache_end) * steps));
         int max_hits = sp.cache_max_hits < 0 ? steps : sp.cache_max_hits;
         k_start<<<nb(n), 256, 0, G.stream>>>(x, noise, init, sig[0], n);
+        if (ersde && sig[0] >= 1.f) sig[0] = 1.f - 1e-4f;  // lambda = sigma / (1 - sigma) needs sigma < 1
 
         for (int i = 0; i < steps; i++) {
             if (cancel && *cancel) throw std::runtime_error("cancelled");
@@ -477,6 +534,16 @@ void sample(Dit& dit, float* x, int Hl, int Wl, const Context& pos, const Contex
                     float a = (float)(aip1 / ad);
                     k_update<<<nb(n), 256, 0, G.stream>>>(x, den, nullptr, (float)(a * r), (float)(a * (1.0 - r)), 0.f, n);
                     k_update<<<nb(n), 256, 0, G.stream>>>(x, anoise, nullptr, 1.f, (float)renoise, 0.f, n);
+                }
+            } else if (ersde) {
+                if (sig[i + 1] == 0.f) {
+                    k_update<<<nb(n), 256, 0, G.stream>>>(x, den, nullptr, 0.f, 1.f, 0.f, n);
+                } else {
+                    // Kiln draws its own per-step noise (CPU randn), so not seed-identical to ComfyUI's
+                    ErSdeCoef c = ersde_coef(sig, i);
+                    std::vector<float> nz = torch_randn(sp.seed + 1 + i, n);
+                    CK(cudaMemcpy(anoise, nz.data(), n * 4, cudaMemcpyHostToDevice));
+                    k_ersde<<<nb(n), 256, 0, G.stream>>>(x, den, old, oldd, anoise, c.a, c.b, c.c2, c.inv2, c.c3, c.inv3, c.cn, c.stage, n);
                 }
             } else {
                 StepCoef co = step_coef(sp.sampler, sig, i, have_old);
@@ -542,6 +609,7 @@ void sample_sd(Unet& unet, float* x, int Hl, int Wl, const SdCond& pos, const Sd
         return;
     }
     if (!known_sampler(sp.sampler)) throw std::runtime_error("unknown sampler " + sp.sampler);
+    if (sp.sampler == "er_sde") throw std::runtime_error("er_sde is only available for Anima models so far");
     std::vector<float> nh = !sp.add_noise ? std::vector<float>(n, 0.f) : sp.noise ? std::vector<float>(sp.noise, sp.noise + n) : torch_randn(sp.seed, n);
 
     size_t m0 = G.arena.mark();

@@ -3,10 +3,20 @@
 // first makes sure Node.js is available. Safe to re-run: finished steps are skipped, interrupted
 // downloads resume, and every download is checked against a pinned SHA256.
 //
-//   node tools/setup.js [--build] [--no-extras] [--verify]
+//   setup.bat                   a menu: everything, prerequisites only, pick parts, or list them
+//   setup.bat all               everything (what the menu's default does)
+//   setup.bat prereqs           only what Kiln needs to run: engine + NVIDIA cuBLAS runtime
+//   setup.bat models            only the models
+//   setup.bat anima vae ...     just these parts (see --list for the names)
+//   setup.bat --list            each part: installed or not, its size, download link and where it goes
+//                               (to download by hand and drop in place)
+//   setup.bat --from <folder>   reuse model files you already have (a ComfyUI models folder, say):
+//                               files with the right name and size are linked or copied, not downloaded
 //     --build      build the engine from source (fetches the CUDA toolkit; needs VS 2022 C++ tools)
 //     --no-extras  skip the upscaler and the face detector
 //     --verify     re-hash model files that are already present
+// Anything already on this PC is skipped: Node.js 20+ (setup.bat), an installed CUDA 13 toolkit's
+// cuBLAS, model files in models\ or in a --from folder or a usual ComfyUI location.
 
 const fs = require('fs');
 const path = require('path');
@@ -20,13 +30,17 @@ const ENGINE_DIR = path.join(ROOT, 'engine', 'build');
 const ENGINE_EXE = path.join(ENGINE_DIR, 'kiln-engine.exe');
 const CUDA_DIR = path.join(ROOT, 'third_party', 'cuda');
 const DL_DIR = path.join(ROOT, 'third_party', 'downloads');
-// prebuilt engines are published in a public repository, so downloading needs no GitHub login
-const ENGINE_URL = process.env.KILN_ENGINE_URL || 'https://github.com/sonsegajp/kiln-releases/releases/latest/download/kiln-engine.exe';
+// the release zip already holds the engine; this is the fallback when it's missing (no login needed)
+const ENGINE_URL = process.env.KILN_ENGINE_URL || 'https://github.com/sonsegajp/kiln/releases/latest/download/kiln-engine.exe';
 
-const args = new Set(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const args = new Set(argv.filter((a) => a.startsWith('--')));
 const FORCE_BUILD = args.has('--build');
 const EXTRAS = !args.has('--no-extras');
 const VERIFY = args.has('--verify');
+const FROM = [];
+for (let i = 0; i < argv.length; i++) if (argv[i] === '--from' && argv[i + 1]) FROM.push(path.resolve(argv[++i]));
+const WORDS = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--from').map((a) => a.toLowerCase());
 
 // ---- pinned downloads ----------------------------------------------------------------------
 const HF = (repo, rev, file) => `https://huggingface.co/${repo}/resolve/${rev}/${file}`;
@@ -134,6 +148,30 @@ async function fetchFile(item, dest) {
   info('ok  ' + path.relative(ROOT, dest));
 }
 
+// Folders that may already hold the model files: --from folders, then the usual ComfyUI places.
+function searchRoots() {
+  const home = process.env.USERPROFILE || '';
+  const guesses = [path.join(home, 'Documents', 'ComfyUI', 'models'), path.join(home, 'ComfyUI', 'models'),
+    'C:\\ComfyUI\\models', 'C:\\ComfyUI_windows_portable\\ComfyUI\\models', 'D:\\ComfyUI\\models', 'D:\\ComfyUI_windows_portable\\ComfyUI\\models'];
+  return [...FROM, ...guesses].filter((d, i, a) => a.indexOf(d) === i && d !== MODELS && fs.existsSync(d));
+}
+function findExisting(item) {
+  const want = path.basename(item.file).toLowerCase();
+  const walk = (dir, depth) => {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    for (const e of ents) {
+      const p = path.join(dir, e.name);
+      if (e.isFile() && e.name.toLowerCase() === want) { try { if (fs.statSync(p).size === item.size) return p; } catch { } }
+    }
+    if (depth <= 0) return null;
+    for (const e of ents) if (e.isDirectory() && !e.name.startsWith('.')) { const f = walk(path.join(dir, e.name), depth - 1); if (f) return f; }
+    return null;
+  };
+  for (const root of searchRoots()) { const f = walk(root, 3); if (f) return f; }
+  return null;
+}
+
 async function ensureModel(item) {
   const dest = path.join(MODELS, ...item.file.split('/'));
   if (fs.existsSync(dest) && fs.statSync(dest).size === item.size) {
@@ -142,6 +180,14 @@ async function ensureModel(item) {
     info(item.file + ' failed verification; downloading it again');
     fs.unlinkSync(dest);
   }
+  const found = findExisting(item);
+  if (found && (await sha256(found, item.file)) === item.sha256) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    try { fs.linkSync(found, dest); info(`linked ${item.file} from ${found} (no download, no extra disk space)`); }
+    catch { info(`copying ${item.file} from ${found}`); fs.copyFileSync(found, dest); info('ok  ' + item.file); }
+    return;
+  }
+  if (found) info(`${found} has the right name and size but different contents; downloading instead`);
   await fetchFile(item, dest);
 }
 
@@ -222,11 +268,17 @@ async function downloadPrebuilt() {
 
 async function ensureCublasDlls() {
   if (CUBLAS_DLLS.every(d => fs.existsSync(path.join(ENGINE_DIR, d)))) { info('have the cuBLAS runtime'); return; }
-  const cudaBin = path.join(CUDA_DIR, 'bin', 'x64');
-  if (CUBLAS_DLLS.every(d => fs.existsSync(path.join(cudaBin, d)))) {
-    for (const d of CUBLAS_DLLS) fs.copyFileSync(path.join(cudaBin, d), path.join(ENGINE_DIR, d));
-    info('copied the cuBLAS runtime from third_party\\cuda');
-    return;
+  // a CUDA 13 toolkit already on this PC (Kiln's own, or NVIDIA's installer: CUDA_PATH / CUDA_PATH_V13_x)
+  const roots = [CUDA_DIR, ...Object.entries(process.env).filter(([k]) => /^CUDA_PATH(_V13_\d+)?$/i.test(k)).map(([, v]) => v)];
+  for (const root of roots) {
+    for (const bin of [path.join(root, 'bin', 'x64'), path.join(root, 'bin')]) {
+      if (CUBLAS_DLLS.every(d => fs.existsSync(path.join(bin, d)))) {
+        fs.mkdirSync(ENGINE_DIR, { recursive: true });
+        for (const d of CUBLAS_DLLS) fs.copyFileSync(path.join(bin, d), path.join(ENGINE_DIR, d));
+        info('copied the cuBLAS runtime from ' + bin + ' (already on this PC)');
+        return;
+      }
+    }
   }
   checkDisk(CUBLAS.size * 3);
   const zip = path.join(DL_DIR, CUBLAS.file);
@@ -282,6 +334,7 @@ async function buildEngine() {
 
 async function ensureEngine() {
   step('Engine');
+  if (!FORCE_BUILD && looksLikeExe(ENGINE_EXE)) { info('have engine\\build\\kiln-engine.exe'); return; }
   if (FORCE_BUILD) {
     await buildEngine();
   } else if (looksLikeExe(ENGINE_EXE)) {
@@ -290,34 +343,94 @@ async function ensureEngine() {
     info('No prebuilt engine is available; building it from source instead.');
     await buildEngine();
   }
-  await ensureCublasDlls();
 }
 
-// ---- models --------------------------------------------------------------------------------
-async function ensureModels() {
-  step('Models (' + MODELS + ')');
-  const list = [...CORE_MODELS, ...(EXTRAS ? EXTRA_MODELS : [])];
-  const missing = list.filter(m => { const f = path.join(MODELS, ...m.file.split('/')); return !(fs.existsSync(f) && fs.statSync(f).size === m.size); });
-  checkDisk(missing.reduce((a, m) => a + m.size, 0) + 256e6);
-  for (const m of list) await ensureModel(m);
-  for (const d of ['loras', 'checkpoints', 'upscale', 'detect']) fs.mkdirSync(path.join(MODELS, d), { recursive: true });
-  if (EXTRAS) {
-    const pt = path.join(MODELS, 'detect', 'face_yolov8m.pt');
-    if (!['.safetensors', '.json'].every(x => fs.existsSync(pt.replace(/\.pt$/, x)))) {
-      info('converting the face detector for the engine');
-      require('./convert_yolo.js').convert(pt);
-    }
+// ---- parts ---------------------------------------------------------------------------------
+// Everything setup can get, by name. prereq: Kiln can't run without it; model: a model file.
+const MODEL = (m, extra) => ({ what: m.what, size: m.size, group: extra ? 'extra' : 'model', item: m,
+  have: () => { const f = path.join(MODELS, ...m.file.split('/')); return fs.existsSync(f) && fs.statSync(f).size === m.size; },
+  run: async () => { step(m.what); await ensureModel(m); if (m.file === 'detect/face_yolov8m.pt') faceConvert(); } });
+const PARTS = {
+  engine: { what: 'Kiln engine (prebuilt; --build to compile it)', size: 7e6, group: 'prereq', have: () => looksLikeExe(ENGINE_EXE), run: ensureEngine },
+  cublas: { what: 'NVIDIA cuBLAS runtime', size: CUBLAS.size, group: 'prereq', have: () => CUBLAS_DLLS.every(d => fs.existsSync(path.join(ENGINE_DIR, d))),
+    run: async () => { step('NVIDIA cuBLAS runtime'); await ensureCublasDlls(); } },
+  anima: MODEL(CORE_MODELS[0]),
+  te: MODEL(CORE_MODELS[1]),
+  vae: MODEL(CORE_MODELS[2]),
+  turbo: MODEL(CORE_MODELS[3]),
+  upscaler: MODEL(EXTRA_MODELS[0], true),
+  face: MODEL(EXTRA_MODELS[1], true),
+};
+const ALIASES = { model: 'anima', dit: 'anima', diffusion: 'anima', 'text-encoder': 'te', encoder: 'te', qwen: 'te', lora: 'turbo', upscale: 'upscaler', detector: 'face', cuda: 'cublas' };
+
+function faceConvert() {
+  const pt = path.join(MODELS, 'detect', 'face_yolov8m.pt');
+  if (fs.existsSync(pt) && !['.safetensors', '.json'].every(x => fs.existsSync(pt.replace(/\.pt$/, x)))) {
+    info('converting the face detector for the engine');
+    require('./convert_yolo.js').convert(pt);
   }
+}
+
+function pickFromWords(words) {
+  const out = new Set();
+  for (const w0 of words) {
+    const w = ALIASES[w0] || w0;
+    if (w === 'all' || w === 'everything') for (const [k, p] of Object.entries(PARTS)) { if (p.group !== 'extra' || EXTRAS) out.add(k); }
+    else if (w === 'prereqs' || w === 'prerequisites') { out.add('engine'); out.add('cublas'); }
+    else if (w === 'models') for (const [k, p] of Object.entries(PARTS)) { if (p.group === 'model' || (p.group === 'extra' && EXTRAS)) out.add(k); }
+    else if (PARTS[w]) out.add(w);
+    else fail(`unknown part "${w0}". Parts: ${Object.keys(PARTS).join(', ')}; or all, prereqs, models.`);
+  }
+  return Object.keys(PARTS).filter((k) => out.has(k));
+}
+
+function listParts() {
+  console.log('\nKiln parts (setup.bat <name> gets one; drop a downloaded file in the folder shown to skip the download):\n');
+  for (const [k, p] of Object.entries(PARTS)) {
+    const where = p.item ? path.relative(ROOT, path.join(MODELS, ...p.item.file.split('/'))) : k === 'engine' ? 'engine\\build\\kiln-engine.exe' : 'engine\\build\\cublas64_13.dll + cublasLt64_13.dll';
+    console.log(`  ${k.padEnd(9)} ${p.have() ? '[installed]' : '[missing]  '} ${p.what} (${gb(p.size)})`);
+    console.log(`            -> ${where}`);
+    if (p.item) console.log(`            ${p.item.url}`);
+    else if (k === 'cublas') console.log(`            ${CUBLAS.url}  (zip; the two DLLs are in bin\\x64)`);
+  }
+  console.log('\n  Shortcuts: all, prereqs (engine + cublas), models. Node.js is handled by setup.bat itself.');
+}
+
+async function menu() {
+  const missing = Object.entries(PARTS).filter(([, p]) => !p.have());
+  console.log('\nWhat should setup get?');
+  console.log('  1  Everything that\'s missing (recommended)' + (missing.length ? `: ${missing.map(([k]) => k).join(', ')}` : ': nothing, all installed'));
+  console.log('  2  Only the prerequisites (engine + NVIDIA cuBLAS), I\'ll bring the models myself');
+  console.log('  3  Pick parts');
+  console.log('  4  List the parts with their download links');
+  const a = (await ask('Choice [1]:')).trim() || '1';
+  if (a === '2') return pickFromWords(['prereqs']);
+  if (a === '3') {
+    const keys = Object.keys(PARTS);
+    keys.forEach((k, i) => console.log(`     ${String(i + 1).padStart(2)}  ${k.padEnd(9)} ${PARTS[k].have() ? '[installed]' : '[missing]  '} ${PARTS[k].what} (${gb(PARTS[k].size)})`));
+    const pick = (await ask('Numbers or names, separated by spaces:')).trim().split(/[\s,]+/).filter(Boolean);
+    return pickFromWords(pick.map((x) => (/^\d+$/.test(x) && keys[Number(x) - 1]) || x));
+  }
+  if (a === '4') { listParts(); return []; }
+  return pickFromWords(['all']);
 }
 
 async function main() {
   console.log('Kiln setup');
+  if (args.has('--list')) { listParts(); return; }
+  const chosen = WORDS.length ? pickFromWords(WORDS) : process.stdin.isTTY ? await menu() : pickFromWords(['all']);
+  if (!chosen.length) return;
   checkGpu();
-  await ensureEngine();
-  await ensureModels();
+  if (FROM.length) info('reusing model files from: ' + FROM.join(', '));
+  const need = chosen.filter((k) => PARTS[k].group !== 'prereq' && !PARTS[k].have()).reduce((a, k) => a + PARTS[k].size, 0);
+  if (need) checkDisk(need + 256e6);
+  for (const k of chosen) await PARTS[k].run();
+  for (const d of ['loras', 'checkpoints', 'upscale', 'detect']) fs.mkdirSync(path.join(MODELS, d), { recursive: true });
   fs.mkdirSync(path.join(ROOT, 'outputs'), { recursive: true });
   try { fs.rmdirSync(DL_DIR); } catch {}
-  console.log('\nAll set. Run start.bat and open http://localhost:8090/');
+  const still = Object.entries(PARTS).filter(([, p]) => p.group !== 'extra' && !p.have()).map(([k]) => k);
+  if (still.length) console.log(`\nDone. Still missing before Kiln can render: ${still.join(', ')} (setup.bat --list shows where they go).`);
+  else console.log('\nAll set. Run start.bat and open http://localhost:8090/');
 }
 
 main().catch((e) => {

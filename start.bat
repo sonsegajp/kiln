@@ -15,5 +15,7 @@ if "%NODE%"=="node" where node >nul 2>nul || (
   pause
   exit /b 1
 )
+rem optional local additions (config\autostart.bat, not part of Kiln)
+if exist "%~dp0config\autostart.bat" call "%~dp0config\autostart.bat"
 "%NODE%" "%~dp0server\server.js"
 if errorlevel 1 pause

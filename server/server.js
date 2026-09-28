@@ -72,7 +72,8 @@ function broadcast(obj) {
     try { res.write(data); } catch (_) { clients.delete(res); }
   }
 }
-setInterval(() => { for (const res of clients) { try { res.write(': ping\n\n'); } catch (_) { } } }, 15000).unref();
+// a named event (comment lines never reach the page): the page reconnects when these stop arriving
+setInterval(() => { for (const res of clients) { try { res.write('event: ping\ndata: {}\n\n'); } catch (_) { } } }, 15000).unref();
 
 // ---------------------------------------------------------------------------
 // models
@@ -182,7 +183,35 @@ const infoWaiters = new Map();
 // VRAM. A parked engine is stopped; the next render unparks it, first asking the holder to let go of the
 // GPU through its release URL so the engine never loads next to the other app's model.
 let parked = null;  // { holder, release_url, since }
-const engineStatus = () => Object.assign(engine.status(), parked ? { parked: parked.holder } : {});
+const engineStatus = () => Object.assign(engine.status(), parked ? { parked: parked.holder } : {},
+  running && running.gpuWaiting ? { gpu_wait: running.gpuWaiting } : {}, gpuPeer ? { gpu_peer: gpuPeer.name } : {});
+
+// ---- GPU peer: another app on this PC with its own model loaded on the same card (for example a local
+// LLM). Both stay loaded; they take turns: before each render Kiln asks the peer for the GPU (the peer
+// answers once its own work is done) and gives it back when the render ends. Rendering while the other
+// model computes is what locks the card up.
+let gpuPeer = null;  // { name, acquire_url, release_url }
+const localUrl = (u) => typeof u === 'string' && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(u) ? u : null;
+async function acquireGpu(j) {
+  const p = gpuPeer;
+  if (!p) return false;
+  j.gpuWaiting = p.name;
+  broadcast({ type: 'engine', engine: engineStatus() });
+  try {
+    const r = await fetch(p.acquire_url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ holder: 'Kiln', job: j.id }), signal: AbortSignal.timeout(20 * 60000) });
+    if (r.status === 404 && gpuPeer === p) { gpuPeer = null; log(`${p.name} is gone; rendering without asking it`); }
+    return r.ok;
+  } catch (e) {
+    log(`${p.name} did not grant the GPU (${e.message}); rendering anyway`);
+    return false;
+  } finally {
+    j.gpuWaiting = null;
+    broadcast({ type: 'engine', engine: engineStatus() });
+  }
+}
+function releaseGpu(p) {
+  if (p && p.release_url) fetch(p.release_url, { method: 'POST', signal: AbortSignal.timeout(10000) }).catch(() => { });
+}
 async function releaseHolder(p) {
   if (!p.release_url) return;
   try {
@@ -198,7 +227,7 @@ function unpark(reason) {
   parked = null;
   log(`engine unparked (${reason}); it was parked for ${p.holder}`);
   broadcast({ type: 'engine', engine: engineStatus() });
-  releaseHolder(p).then(() => { if (!engine.proc && !parked) engine.start(); });
+  releaseHolder(p).then(() => { if (!engine.proc && !parked) { engine.args = engineArgs(); engine.start(); } });
 }
 
 engine.on('log', (m) => log(m));
@@ -212,7 +241,7 @@ engine.on('state', () => {
 });
 engine.on('exit', () => {
   engineFamily = 'anima';
-  engineDit = DEFAULT_DIT;
+  engineDit = lastDit;  // what the next start loads (engineArgs)
   if (running) {
     const j = running;
     running = null;
@@ -220,6 +249,8 @@ engine.on('exit', () => {
   }
 });
 engine.on('event', onEngineEvent);
+// Animadex character index (tags for ~36k characters the Anima model knows)
+const animadex = require('./lib/animadex').createAnimadex({ modelsDir: MODELS, log });
 
 // hot-swap: mock -> real engine as soon as the exe appears (only while idle)
 setInterval(() => {
@@ -237,6 +268,13 @@ let engineFamily = 'anima';   // model family loaded in the engine (it starts wi
 // Anima DiT loaded in the engine (it starts with the stock base model; null = unknown after a graph swapped it)
 const DEFAULT_DIT = path.join(MODELS, 'anima-base-v1.0.safetensors');
 let engineDit = DEFAULT_DIT;
+// the DiT the last Anima job used: a restarted engine (crash, park) starts on it, saving a model swap
+let lastDit = DEFAULT_DIT;
+function vramBudget() {
+  try { const c = JSON.parse(fs.readFileSync(path.join(CONFIG, 'engine.json'), 'utf8')); return Math.floor(Number(c.vram_budget_mb)) || 0; } catch (_) { return 0; }
+}
+const engineArgs = () => ['--models', MODELS, ...(sameFile(lastDit, DEFAULT_DIT) ? [] : ['--dit', lastDit]),
+  ...(vramBudget() ? ['--vram-budget', String(vramBudget())] : [])];
 const sameFile = (a, b) => !!a && !!b && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const jobs = new Map();
 const queue = [];
@@ -485,6 +523,22 @@ function pump() {
   if (running || engine.state !== 'ready' || !queue.length) return;
   const j = queue.shift();
   running = j;
+  if (gpuPeer && !j.gpuLease) {
+    const p = gpuPeer;
+    acquireGpu(j).then((granted) => {
+      if (granted) j.gpuLease = p;
+      if (running !== j) { if (j.gpuLease) { releaseGpu(j.gpuLease); j.gpuLease = null; } setImmediate(pump); return; }  // cancelled meanwhile
+      j.gpuLease = j.gpuLease || true;
+      runJob(j);
+    });
+    emitQueue();
+    return;
+  }
+  runJob(j);
+}
+
+function runJob(j) {
+  if (engine.state !== 'ready') { running = null; queue.unshift(j); if (j.gpuLease && j.gpuLease !== true) releaseGpu(j.gpuLease); j.gpuLease = null; return; }
   j.status = 'running';
   j.started = Date.now();
   const p = j.params;
@@ -547,7 +601,10 @@ function pump() {
     return;
   }
   j.swap = swap; engineFamily = j.family;
-  if (j.family === 'anima' && j.dit) engineDit = j.dit;
+  if (j.family === 'anima' && j.dit) {
+    engineDit = j.dit;
+    if (!sameFile(lastDit, j.dit)) { lastDit = j.dit; engine.args = engineArgs(); }
+  }
   const enh = [p.hires && `hires=${p.hires.scale}x/${p.hires.steps}st/${p.hires.upscaler}`, p.face && `face=${p.face.steps}st`, p.upscale && `upscale=${p.upscale.factor}x`].filter(Boolean).join(' ');
   log(`job ${j.id} start${j.family === 'sdxl' ? ' SDXL ' + path.basename(j.checkpoint) + (j.swap ? ' (model swap)' : '') + ' ' + p.scheduler : ''} ${p.width}x${p.height} steps=${p.steps} cfg=${p.cfg}${p.cfg > 1 && p.cfg_cutoff < 1 ? '@' + p.cfg_cutoff : ''} seed=${p.seed}${p.sampler !== 'euler' ? ' ' + p.sampler : ''}${p.step_cache > 0 ? ' cache=' + p.step_cache : ''}${req.nag ? ' nag=' + req.nag.scale : ''}${enh ? ' ' + enh : ''} (${queue.length} queued)`);
   emitJob(j);
@@ -556,6 +613,7 @@ function pump() {
 
 function finishJob(j, status, extra = {}) {
   Object.assign(j, extra);
+  if (j.gpuLease) { if (j.gpuLease !== true) releaseGpu(j.gpuLease); j.gpuLease = null; }
   j.status = status;
   j.finished = Date.now();
   if (j.started) j.wallMs = j.finished - j.started;
@@ -1203,7 +1261,7 @@ async function readRaw(req, limit) {
 }
 
 // ---- extensions panel API -----------------------------------------------------------
-const isLoopback = (req) => /^(127\.|::1$|::ffff:127\.)/.test(req.socket.remoteAddress || '');
+const isLoopback = (req) => !req.headers['x-kiln-remote'] && /^(127\.|::1$|::ffff:127\.)/.test(req.socket.remoteAddress || '');  // requests forwarded by a local reverse proxy come from 127.0.0.1 too
 function manageDenied(req) {
   if (!EXT_LAN && !isLoopback(req)) return 'managing extensions is only allowed on the PC running Kiln (start the server with KILN_EXT_LAN=1 to allow other devices)';
   // browsers: same-origin pages only, so another website can't install packs through your browser
@@ -1399,6 +1457,7 @@ function cancelJob(j) {
   if (j.status === 'queued') {
     const i = queue.indexOf(j);
     if (i >= 0) queue.splice(i, 1);
+    if (running === j) running = null;  // it was waiting for the GPU peer
     finishJob(j, 'cancelled');
     return true;
   }
@@ -1430,6 +1489,7 @@ async function handle(req, res) {
   if (p.startsWith('/api/')) {
     if (await handleGraphRoutes(req, res, u, p, m)) return;
     if (await handleExtRoutes(req, res, u, p, m)) return;
+    if (await animadex.handle(req, res, u, p, m, sendJSON)) return;
     if (await library.handle(req, res, u, p, m, features)) return;
     if (p === '/api/events' && m === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -1475,6 +1535,26 @@ async function handle(req, res) {
       if (engine.proc) await new Promise((r) => { const t = setTimeout(r, 10000); engine.once('exit', () => { clearTimeout(t); r(); }); engine.stop(); });
       else engine.stop();  // also cancels a pending restart
       log(`engine parked: VRAM freed for ${parked.holder}`);
+      broadcast({ type: 'engine', engine: engineStatus() });
+      return sendJSON(res, 200, engineStatus());
+    }
+    if (p === '/api/gpu/peer' && m === 'POST') {
+      if (!isLoopback(req)) return sendJSON(res, 403, { error: 'only apps on this PC can share the GPU' });
+      let b = {};
+      try { b = await readJSON(req); } catch (_) { }
+      const acq = localUrl(b.acquire_url), rel = localUrl(b.release_url);
+      if (!acq || !rel) return sendJSON(res, 400, { error: 'acquire_url and release_url must be http://127.0.0.1 URLs' });
+      const name = String(b.name || 'another app').slice(0, 40);
+      if (!gpuPeer || gpuPeer.acquire_url !== acq) log(`sharing the GPU with ${name}: renders wait for its turn`);
+      gpuPeer = { name, acquire_url: acq, release_url: rel };
+      if (parked) unpark(`${name} shares the GPU now`);
+      broadcast({ type: 'engine', engine: engineStatus() });
+      return sendJSON(res, 200, engineStatus());
+    }
+    if (p === '/api/gpu/peer' && m === 'DELETE') {
+      if (!isLoopback(req)) return sendJSON(res, 403, { error: 'only apps on this PC can do that' });
+      if (gpuPeer) log(`stopped sharing the GPU with ${gpuPeer.name}`);
+      gpuPeer = null;
       broadcast({ type: 'engine', engine: engineStatus() });
       return sendJSON(res, 200, engineStatus());
     }
@@ -1602,6 +1682,7 @@ function main() {
     const ps = packs.summary();
     console.log(`  Packs:   ${ps.packs} in ${EXTENSIONS} (${ps.nodes} nodes${ps.errors ? ', ' + ps.errors + ' with errors' : ''})`);
     console.log('');
+    engine.args = engineArgs();
     engine.start();
     civitai.pump();
   });

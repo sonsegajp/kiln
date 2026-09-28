@@ -24,11 +24,13 @@ struct Weight {
     bool f16 = false;             // p holds fp16 instead of bf16 (fp16 checkpoints such as SDXL keep their precision)
     bool on_host = false;
     void* host = nullptr;  // host address of a mapped allocation (not always equal to p on WDDM)
+    bool file_mapped = false;  // host points into the model file's mapping (pageable, no device pointer):
+                               // only linear() may use it, through the stage
     // LoRAs run unmerged as a low-rank side path: y += scale * B(A x). Merging is not an option
     // for bf16 weights: typical deltas (~1e-5) are below bf16's step (~8e-5 at |w| ~ 0.02).
     std::vector<LoraAdd>* lora = nullptr;
     int64_t numel() const { return rows * cols; }
-    explicit operator bool() const { return p != nullptr; }
+    explicit operator bool() const { return p != nullptr || host != nullptr; }
 };
 
 struct LoraAdd { Weight A, B; float scale; };  // A [r, in], B [out, r]
@@ -69,6 +71,9 @@ struct Gpu {
     size_t stage_elems = 0;
     size_t wbuf_elems = 0;
     size_t reserve_bytes = 0;     // VRAM that Auto placement must leave free
+    size_t leave_free = 0;        // VRAM that belongs to another app (--vram-budget): Kiln never grows into it
+    bool file_map_ok = false;     // set only while the DiT / text encoder load (their matrices go through linear/matvec)
+    bool no_file_map = false;     // the loader marks weights read outside linear() (embedding tables)
     bool fp16 = true;             // fp16x2 GEMMs (fast path); false = exact fp32 cuBLAS everywhere
 };
 extern Gpu G;

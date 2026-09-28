@@ -52,7 +52,7 @@
     };
     return expand(frame.join(''), 1);
   }
-  const SAMPLER_LABEL = { euler: 'Euler', euler_ancestral: 'Euler a', dpmpp_2m: 'DPM++ 2M', res_multistep: 'Res Multistep' };
+  const SAMPLER_LABEL = { euler: 'Euler', euler_ancestral: 'Euler a', dpmpp_2m: 'DPM++ 2M', res_multistep: 'Res Multistep', er_sde: 'ER SDE' };
   const SCHED_LABEL = { simple: 'Simple', sgm_uniform: 'SGM Uniform', karras: 'Karras', exponential: 'Exponential', ddim_uniform: 'DDIM Uniform', beta: 'Beta', normal: 'Normal', linear_quadratic: 'Linear Quadratic', kl_optimal: 'KL Optimal' };
   const stem = (f) => String(f || '').split('/').pop().replace(/\.(safetensors|sft|ckpt|pt)$/i, '');
   const q = (v) => (/[,:\n"]/.test(String(v)) ? JSON.stringify(String(v)) : String(v));
@@ -213,7 +213,7 @@
   const renderSliders = () => { for (const s of sliders.values()) s.update(); };
 
   // ---------------------------------------------------------------- selects, radios, checkboxes
-  const ENGINE_SAMPLERS = ['euler', 'dpmpp_2m', 'res_multistep'];
+  const ENGINE_SAMPLERS = ['euler', 'dpmpp_2m', 'res_multistep', 'er_sde'];
   const SDXL_SAMPLERS = ['euler', 'euler_ancestral', 'dpmpp_2m', 'res_multistep'];
   const SDXL_SCHEDS = ['normal', 'karras', 'simple', 'sgm_uniform', 'exponential', 'ddim_uniform', 'beta', 'linear_quadratic', 'kl_optimal'];
   function fillSel(sel, list, labels, cur) {
@@ -625,6 +625,71 @@
     if (d && FAM === 'anima' && !lsGet(LS) && !lsGet('kiln.settings.v1')) { G = merged(Object.assign(clone(DEF), clone(d))); save(); renderAll(); }
   }
 
+  // ---------------------------------------------------------------- characters (Animadex)
+  // Search the character index the server keeps and add a character's tags to the prompt: the trigger
+  // (name + series), their look, and (optionally) their usual outfit. Tags already in the prompt are skipped.
+  const CH = { ready: false, timer: null, seq: 0 };
+  function charTagsFor(c) {
+    const have = new Set(G.prompt.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+    const hasCount = [...have].some((t) => /^\d\+?(girls?|boys?|others?)$/.test(t));
+    const tags = [c.trigger, ...($('charLook').checked ? c.look : []), ...($('charOutfit').checked ? c.outfit : [])]
+      .join(', ').split(',').map((t) => t.trim()).filter(Boolean)
+      .filter((t) => !(hasCount && /^\d\+?(girls?|boys?|others?)$/i.test(t)));
+    const out = [];
+    for (const t of tags) { const k = t.toLowerCase(); if (!have.has(k)) { have.add(k); out.push(t); } }
+    return out;
+  }
+  function addCharacter(c) {
+    const add = charTagsFor(c);
+    if (!add.length) { toast(`${c.name} is already in the prompt`); return; }
+    const cur = G.prompt.replace(/[\s,]+$/, '');
+    const t = cur ? `${cur}, ${add.join(', ')}` : add.join(', ');
+    promptEl.value = t; G.prompt = t; autoGrow(promptEl, 76); save(); tokPos(); renderSlotWarn(); promptChanged();
+    $('charSum').textContent = c.name;
+    toast(`Added ${c.name}`);
+  }
+  function charRow(c) {
+    const b = el('button', 'char-item'); b.type = 'button';
+    if (c.thumb) { const im = el('img'); im.loading = 'lazy'; im.alt = ''; im.src = c.thumb; im.onerror = () => { im.replaceWith(el('span', 'char-noimg')); }; b.appendChild(im); }
+    else b.appendChild(el('span', 'char-noimg'));
+    const meta = el('span', 'char-meta');
+    meta.append(el('span', 'char-name', c.name), el('span', 'char-sub', `${c.series || '—'} · ${c.count.toLocaleString()} posts${c.loras ? ' · LoRA on CivitAI' : ''}`),
+      el('span', 'char-tags', [...c.look, ...c.outfit].join(', ')));
+    b.appendChild(meta);
+    b.title = [c.trigger, ...c.look, ...c.outfit].join(', ');
+    b.addEventListener('click', () => addCharacter(c));
+    return b;
+  }
+  async function charSearch() {
+    const seq = ++CH.seq;
+    const q = $('charQ').value.trim();
+    try {
+      const r = await api('/api/animadex/search?limit=40&q=' + encodeURIComponent(q));
+      if (seq !== CH.seq) return;
+      const list = $('charList');
+      list.textContent = '';
+      if (!r.items.length) list.appendChild(el('div', 'char-empty', 'No character matches that.'));
+      for (const c of r.items) list.appendChild(charRow(c));
+    } catch (e) { if (seq === CH.seq) toast(e.message, 'err'); }
+  }
+  async function charStatus() {
+    try {
+      const s = await api('/api/animadex/status');
+      CH.ready = s.ready;
+      $('charDl').hidden = s.ready;
+      $('charSearch').hidden = !s.ready;
+      if (s.ready && !$('charList').children.length) charSearch();
+    } catch (_) { }
+  }
+  $('charQ').addEventListener('input', () => { clearTimeout(CH.timer); CH.timer = setTimeout(charSearch, 200); });
+  $('charDlBtn').addEventListener('click', async () => {
+    const b = $('charDlBtn');
+    b.disabled = true; b.textContent = 'Downloading…';
+    try { await api('/api/animadex/download', { method: 'POST' }); await charStatus(); toast('Character list ready'); }
+    catch (e) { toast(e.message, 'err', 6000); b.disabled = false; b.textContent = 'Download character list'; }
+  });
+  $('accChar').addEventListener('toggle', () => { if ($('accChar').open) charStatus(); });
+
   // ---------------------------------------------------------------- generate (txt2img / img2img)
   const BUSY = { groups: new Set(), graphJobs: new Set() };
   async function generate() {
@@ -666,6 +731,7 @@
     }
   }
   K.on('generate', (d) => { if (d.tab === 'txt2img' || d.tab === 'img2img') generate(); });
+  K.on('resume', () => loadGallery(true));  // images finished while the app was in the background
   $('generateBtn').addEventListener('click', generate);
   $('interruptBtn').addEventListener('click', async () => {
     for (const g of BUSY.groups) await K.cancel(g);
@@ -1374,7 +1440,7 @@
     const num = (k) => (P[k] !== undefined && P[k] !== '' && isFinite(Number(P[k])) ? Number(P[k]) : undefined);
     const p = { prompt: x.prompt, negative: x.negative, steps: num('Steps'), cfg: num('CFG scale'), seed: num('Seed'), shift: num('Shift'), denoise: num('Denoising strength') };
     const sm = String(P.Sampler || '').toLowerCase();
-    const SK = { 'euler': 'euler', 'euler a': 'euler_ancestral', 'dpm++ 2m': 'dpmpp_2m', 'dpm++ 2m karras': 'dpmpp_2m', 'res multistep': 'res_multistep' };
+    const SK = { 'euler': 'euler', 'euler a': 'euler_ancestral', 'dpm++ 2m': 'dpmpp_2m', 'dpm++ 2m karras': 'dpmpp_2m', 'res multistep': 'res_multistep', 'er sde': 'er_sde', 'er_sde': 'er_sde' };
     if (SK[sm]) p.sampler = SK[sm];
     if (/karras/.test(sm)) p.scheduler = 'karras';
     if (P['Schedule type']) { const s = String(P['Schedule type']).toLowerCase().replace(/ /g, '_'); if (SCHED_LABEL[s]) p.scheduler = s; }

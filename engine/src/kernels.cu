@@ -117,6 +117,7 @@ void gpu_reserve_stage(size_t elems) {
 }
 
 const void* stage_weight(const void* dev, const void* host, size_t bytes) {
+    if (!dev && host && (!G.stage || bytes > G.stage_elems * 2)) throw std::runtime_error("a file-mapped weight needs the VRAM stage");
     if (!host || !G.stage || bytes > G.stage_elems * 2) return dev;  // no stage: kernels read the mapped RAM directly
     ProfScope ps("weight_stream");
     CK(cudaMemcpyAsync(G.stage, host, bytes, cudaMemcpyHostToDevice, G.stream));
@@ -190,6 +191,16 @@ Weight upload_weight(const StTensor& t, Place place, bool temporal_last, bool f1
     w.f16 = f16;
     size_t bytes = (size_t)w.numel() * 2;
     bool device = place == Place::Device || (place == Place::Auto && gpu_free_bytes() > bytes + G.reserve_bytes);
+    // Sharing the card (--vram-budget): big matrices that don't fit in VRAM stream straight from the model
+    // file's mapping, which Windows can page and share with its file cache, instead of a locked copy in RAM
+    // (locked copies next to another app's model ran a 16 GB PC out of memory). linear() stages them.
+    if (!device && G.leave_free && G.file_map_ok && !G.no_file_map && !f16 && !temporal_last && t.dtype == DType::BF16 &&
+        w.rows > 1 && w.cols > 1 && bytes >= ((size_t)256 << 10) && bytes <= ((size_t)64 << 20)) {
+        w.host = const_cast<void*>(static_cast<const void*>(t.data));
+        w.on_host = true;
+        w.file_mapped = true;
+        return w;
+    }
     if (device) {
         CK(cudaMalloc(&w.p, bytes));
     } else {
@@ -377,7 +388,8 @@ __global__ void k_scale(float* y, float s, int n) {
 void matvec(float* y, const Weight& W, const float* x, const float* add) {
     ProfScope ps("matvec");
     int rows = (int)W.rows;
-    k_matvec<<<nblk(rows, 8), 256, 0, G.stream>>>(y, W.p, x, add, rows, (int)W.cols);
+    const uint16_t* wp = W.on_host ? (const uint16_t*)stage_weight(W.p, W.host, (size_t)W.numel() * 2) : W.p;
+    k_matvec<<<nblk(rows, 8), 256, 0, G.stream>>>(y, wp, x, add, rows, (int)W.cols);
     if (!W.lora) return;
     for (auto& l : *W.lora) {
         int r = (int)l.A.rows;

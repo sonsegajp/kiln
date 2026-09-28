@@ -18,7 +18,6 @@
     return 'other';
   }
   const models = () => K.S.models || { loras: [], sd_models: [], bases: [] };
-  const canManage = () => !!(K.S.settings && K.S.settings.manage);
 
   // ---------------------------------------------------------------- Extra Networks panel
   const X = { open: false, tab: lsGet('kiln.xnet.tab') || 'lora', q: '', sort: 'name' };
@@ -284,7 +283,6 @@
     ui.status.append(el('span', '', CV.loading ? 'Loading…' : `${CV.items.length}${CV.done ? '' : '+'} result${CV.items.length === 1 ? '' : 's'}`));
     ui.status.append(el('span', '', `base: ${bases.length ? bases.join(', ') : 'any'}`));
     if (ck && ck.identifying && !/^(done|error)/.test(ck.identifying)) ui.status.append(el('span', '', `identifying ${ck.name} (${ck.identifying})…`));
-    if (!canManage()) ui.status.append(el('span', '', 'downloads start on the PC running Kiln only'));
     $('cvFullSub').textContent = ck ? `checkpoint: ${ck.name} (${ck.base || K.FAMILY[ck.family]})` : '';
   }
   function thumbFor(m) {
@@ -537,7 +535,6 @@
     }
     const b = el('button', 'a-btn sm primary', 'Download'); b.type = 'button';
     if (!f.safe) { b.disabled = true; b.title = f.pickle ? 'Pickle (.ckpt/.pt) files can run code when loaded; Kiln only downloads .safetensors' : 'Kiln only downloads .safetensors files'; row.appendChild(el('span', 'a-badge bad', f.pickle ? 'pickle: not downloaded' : 'not safetensors')); }
-    else if (!canManage()) { b.disabled = true; b.title = 'Downloads start on the PC running Kiln only (Settings)'; }
     else if (!['LORA', 'LoCon', 'DoRA', 'Checkpoint', 'TextualInversion', 'Upscaler'].includes(m.type)) { b.disabled = true; b.title = `Kiln can't use ${m.type} files`; }
     b.addEventListener('click', async () => {
       b.disabled = true; b.textContent = 'Queued…';
@@ -609,7 +606,6 @@
     top.append(el('span', 'cv-dlname', `${d.name}${d.versionName ? ' · ' + d.versionName : ''}`), el('span', 'a-badge' + (d.status === 'done' ? ' ok' : d.status === 'error' ? ' bad' : ''), d.status));
     const act = (label, path, cls) => {
       const b = el('button', 'a-btn sm' + (cls ? ' ' + cls : ''), label); b.type = 'button';
-      b.disabled = !canManage();
       b.addEventListener('click', async () => { try { const r = await api(`/api/civitai/downloads/${d.id}/${path}`, { method: 'POST', body: {} }); DL.list = r.downloads; renderDownloads(); renderDlCount(); } catch (e) { toast(e.message, 'err', 7000); } });
       top.appendChild(b);
     };

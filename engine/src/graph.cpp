@@ -691,7 +691,7 @@ std::vector<ValPtr> Run::exec(const std::string& nid, const std::string& ct) {
         sp.cfg = (float)num(nid, "cfg", 8.0);
         sp.sampler = str(nid, "sampler_name", "euler");
         sp.scheduler = str(nid, "scheduler", "simple");
-        if (!known_sampler(sp.sampler)) fail("sampler '" + sp.sampler + "' is not available in Kiln (euler, euler_ancestral, dpmpp_2m, res_multistep)");
+        if (!known_sampler(sp.sampler)) fail("sampler '" + sp.sampler + "' is not available in Kiln (euler, euler_ancestral, dpmpp_2m, res_multistep, er_sde)");
         if (!known_scheduler(sp.scheduler)) fail("unknown scheduler '" + sp.scheduler + "'");
         ValPtr nag;
         if (ct == "KSamplerAdvanced") {

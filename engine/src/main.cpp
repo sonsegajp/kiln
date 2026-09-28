@@ -442,19 +442,22 @@ static Job parse_job(const Json& r) {
     return j;
 }
 
+
 int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
-    std::string models = "models", golden, lora;
+    std::string models = "models", golden, lora, initial_dit;
     int device = 0;
-    size_t reserve_mb = 1000;
+    size_t reserve_mb = 1000, vram_budget_mb = 0;
     int bench_w = 0, bench_h = 0;
     std::string repeat_file, bench_sdxl_ckpt;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
         if (a == "--models") models = next();
+        else if (a == "--dit") initial_dit = next();
         else if (a == "--device") device = std::stoi(next());
         else if (a == "--reserve-mb") reserve_mb = std::stoul(next());
+        else if (a == "--vram-budget") vram_budget_mb = std::stoul(next());
         else if (a == "--selftest") golden = next();
         else if (a == "--lora") lora = next();
         else if (a == "--repeat") repeat_file = next();
@@ -466,7 +469,14 @@ int main(int argc, char** argv) {
     try {
         gpu_init(device);
         G.reserve_bytes = reserve_mb << 20;
-        E.load(models);
+        if (vram_budget_mb) {
+            // share the card with another app (a game, a local LLM): Kiln uses at most this much VRAM; what doesn't
+            // fit (the DiT, the text encoder) stays in system RAM and streams through a small stage
+            size_t free0 = gpu_free_bytes(), budget = vram_budget_mb << 20;
+            G.leave_free = free0 > budget ? free0 - budget : 0;
+            G.reserve_bytes = G.leave_free + ARENA_TARGET + ((size_t)200 << 20);  // weights leave room for the arena
+        }
+        E.load(models, initial_dit);
     } catch (const std::exception& e) {
         emit(std::string("{\"ev\":\"fatal\",\"msg\":") + json_escape(e.what()) + "}");
         return 1;
@@ -549,7 +559,7 @@ int main(int argc, char** argv) {
                 if (it->id == id) { queue.erase(it); emit("{\"id\":" + json_escape(id) + ",\"ev\":\"cancelled\"}"); break; }
         } else if (cmd == "info") {
             emit("{\"id\":" + json_escape(id) + ",\"ev\":\"info\",\"gpu\":" + json_escape(gpu_name) + ",\"vram_free_mb\":" + std::to_string(gpu_free_bytes() >> 20) +
-                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"features\":{\"ext\":true}}");
+                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"family\":" + json_escape(E.family) + ",\"features\":{\"ext\":true}}");
         } else {
             log_msg("unknown cmd " + cmd);
         }

@@ -36,3 +36,8 @@
 node_modules/
 __pycache__/
 *.pyc
+
+
+
+# release zips (tools/make-dist.js)
+/dist/

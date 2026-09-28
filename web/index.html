@@ -180,6 +180,25 @@
             </div>
           </div>
 
+          <details class="a-acc" id="accChar">
+            <summary><span class="a-acc-title">Characters</span><span class="a-acc-sum" id="charSum">Animadex</span></summary>
+            <div class="a-acc-body">
+              <div class="char-dl" id="charDl" hidden>
+                <span class="a-hint">The Animadex character list (tags for ~36,000 characters Anima knows) isn't downloaded yet (32 MB, once).</span>
+                <button type="button" class="a-btn" id="charDlBtn">Download character list</button>
+              </div>
+              <div class="char-search" id="charSearch" hidden>
+                <input type="search" id="charQ" placeholder="Search characters or series…" autocomplete="off" spellcheck="false">
+                <div class="char-opts">
+                  <label><input type="checkbox" id="charLook" checked> Look</label>
+                  <label><input type="checkbox" id="charOutfit" checked> Outfit</label>
+                </div>
+                <div class="char-list" id="charList"></div>
+                <div class="a-hint">Tap a character to add their tags to the prompt. Untick Outfit to dress them yourself.</div>
+              </div>
+            </div>
+          </details>
+
           <details class="a-acc" id="accFace" data-only="txt2img">
             <summary><label class="a-acc-check"><input type="checkbox" id="faceOn"><span>Face Detailer</span></label><span class="a-acc-sum" id="faceSum"></span></summary>
             <div class="a-acc-body">

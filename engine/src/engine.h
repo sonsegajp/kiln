@@ -225,18 +225,18 @@ struct Engine {
 
     std::string dit_path, default_dit;
 
-    void load(const std::string& dir) {
+    // initial_dit: start on this Anima checkpoint instead of the stock base model (the server passes the
+    // one its last job used, so a restart doesn't cost a model swap on the next render)
+    void load(const std::string& dir, const std::string& initial_dit = "") {
         models = dir;
         default_dit = dit_path = dir + "\\anima-base-v1.0.safetensors";
+        if (!initial_dit.empty() && GetFileAttributesA(initial_dit.c_str()) != INVALID_FILE_ATTRIBUTES) dit_path = initial_dit;
         auto t0 = Clock::now();
         auto path = [&](const char* f) { return dir + "\\" + f; };
-        emit("{\"ev\":\"loading\",\"what\":\"dit\"}");
-        dit.load(dit_path, Place::Auto);
+        // small, conv-heavy models first: with a VRAM budget they keep the VRAM and the big DiT and text
+        // encoder (plain matmuls, which stream well) go to system RAM
         emit("{\"ev\":\"loading\",\"what\":\"vae\"}");
         vae.load(path("qwen_image_vae.safetensors"), Place::Auto);
-        emit("{\"ev\":\"loading\",\"what\":\"te\"}");
-        te.load(path("qwen_3_06b_base.safetensors"), Place::Auto);
-        // post-processing models load now, while VRAM is still free, if their files exist
 #ifdef KILN_FACE
         if (GetFileAttributesA((dir + "\\detect\\face_yolov8m.safetensors").c_str()) != INVALID_FILE_ATTRIBUTES) {
             emit("{\"ev\":\"loading\",\"what\":\"face\"}");
@@ -247,13 +247,21 @@ struct Engine {
         emit("{\"ev\":\"loading\",\"what\":\"upscale\"}");
         upscale_model();
 #endif
+        emit("{\"ev\":\"loading\",\"what\":\"dit\"}");
+        dit.load(dit_path, Place::Auto);
+        emit("{\"ev\":\"loading\",\"what\":\"te\"}");
+        te.load(path("qwen_3_06b_base.safetensors"), Place::Auto);
         bool spilled = false;  // weights in system RAM stream through a VRAM stage (see stage_weight)
         for (auto& [n, w] : dit.named) spilled |= w->on_host;
         if (spilled) gpu_reserve_stage(STAGE_ELEMS);
         size_t free_b = gpu_free_bytes();
-        size_t wbuf = (size_t)8192 * 2048;
+        size_t wbuf = WBUF_ELEMS;
         size_t margin = (size_t)160 << 20;
-        size_t arena = free_b > wbuf * 4 + margin ? free_b - wbuf * 4 - margin : 0;
+        size_t arena = free_b > wbuf * 4 + margin + G.leave_free ? free_b - wbuf * 4 - margin - G.leave_free : 0;
+        if (G.leave_free) {
+            arena = std::min(arena, ARENA_TARGET);
+            G.reserve_bytes = G.leave_free + ((size_t)128 << 20);  // LoRAs may use what's left of the budget
+        }
         gpu_alloc_scratch(wbuf, arena);
         int host_dit = 0;
         for (auto& [n, w] : dit.named) host_dit += w->on_host;
@@ -472,7 +480,7 @@ struct Engine {
         for (auto& [n, w] : dit.named) free_weight(*w);
         dit = Dit();
         size_t keep = G.reserve_bytes;
-        G.reserve_bytes = (size_t)256 << 20;  // the arena already exists: only a small margin is needed
+        G.reserve_bytes = ((size_t)256 << 20) + G.leave_free;  // the arena already exists: only a small margin is needed
         dit_path.clear();  // if the load fails, the next job loads again
         dit.load(path, Place::Auto);
         G.reserve_bytes = keep;
@@ -484,7 +492,8 @@ struct Engine {
     // arena first (without it jobs fail), then the weights, largest first (they cost the most per step).
     void prepare_job() {
         if (G.arena.used == 0 && G.arena.cap < ARENA_TARGET) {
-            size_t margin = (size_t)160 << 20, avail = G.arena.cap + gpu_free_bytes();
+            size_t margin = (size_t)160 << 20, fr = gpu_free_bytes();
+            size_t avail = G.arena.cap + (fr > G.leave_free ? fr - G.leave_free : 0);
             size_t target = std::min(ARENA_TARGET, avail > margin ? avail - margin : 0);
             if (target > G.arena.cap + ((size_t)32 << 20)) {
                 size_t was = G.arena.cap;
@@ -497,7 +506,7 @@ struct Engine {
         if (!host.empty()) {
             std::sort(host.begin(), host.end(), [](Weight* a, Weight* b) { return a->numel() > b->numel(); });
             int moved = 0;
-            for (Weight* w : host) moved += promote_weight(*w, (size_t)256 << 20);
+            for (Weight* w : host) moved += promote_weight(*w, ((size_t)256 << 20) + G.leave_free);
             if (moved) log_msg("moved " + std::to_string(moved) + " of " + std::to_string(host.size()) + " DiT tensors from system RAM back to VRAM");
         }
     }
@@ -505,6 +514,7 @@ struct Engine {
     // ---- model families: 6 GB holds Anima or SDXL, not both, so a job for the other family swaps them
     Sdxl sdxl;
     std::string family = "anima";
+    static constexpr size_t WBUF_ELEMS = (size_t)8192 * 2048;  // fp32 staging for one weight matrix
 
     void unload_anima() {
         loras.reset();
@@ -525,7 +535,7 @@ struct Engine {
         else if (family == "sdxl") sdxl.free();
         gpu_sync();
         size_t keep = G.reserve_bytes;
-        G.reserve_bytes = (size_t)200 << 20;  // the arena already exists: leave only a small margin
+        G.reserve_bytes = ((size_t)200 << 20) + G.leave_free;  // the arena already exists: leave only a small margin
         try {
             if (fam == "sdxl") {
                 if (!G.stage) gpu_reserve_stage(STAGE_ELEMS);  // SDXL's UNet rarely fits entirely next to the arena
@@ -534,6 +544,9 @@ struct Engine {
                 dit.load(dit_path, Place::Auto);
                 vae.load(models + "\\qwen_image_vae.safetensors", Place::Auto);
                 te.load(models + "\\qwen_3_06b_base.safetensors", Place::Auto);
+                bool spilled = false;  // weights in system RAM stream through the stage
+                for (auto& [n, w] : dit.named) spilled |= w->on_host;
+                if (spilled && !G.stage) gpu_reserve_stage(STAGE_ELEMS);
             }
         } catch (...) {
             G.reserve_bytes = keep;
@@ -544,6 +557,7 @@ struct Engine {
         family = fam;
         log_msg((fam == "sdxl" ? "SDXL " + ckpt : std::string("Anima")) + " loaded in " + std::to_string((int)ms_since(t0)) + " ms");
     }
+
 
     // [-1,1] rgb [3, H, W] on the GPU -> RGB8 file, then the job's done event
     void finish_image(const Job& j, const float* img, int H, int W, Clock::time_point t0, std::ostringstream& tm) {

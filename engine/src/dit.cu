@@ -9,6 +9,7 @@ void rope_table(std::vector<float>& c, std::vector<float>& s, int T, int Dh, flo
 static const int D = 2048, NH = 16, DH = 128, AD = 1024, AH = 16, ADH = 64;
 
 void Dit::load(const std::string& path, Place place) {
+    struct MapOk { MapOk() { G.file_map_ok = true; } ~MapOk() { G.file_map_ok = false; } } map_ok;  // st stays open: mapped weights point into it
     st = std::make_unique<SafeTensors>(path);
     for (auto& [name, t] : st->all()) {
         const std::string tail = "x_embedder.proj.1.weight";
@@ -81,7 +82,9 @@ void Dit::load(const std::string& path, Place place) {
         R(b.mlp2, p + "mlp.2.weight");
         R(b.mlp2_b, p + "mlp.2.bias");
     }
+    G.no_file_map = true;  // embed_rows reads it directly
     R(ad_embed, "llm_adapter.embed.weight");
+    G.no_file_map = false;
     R(ad_out, "llm_adapter.out_proj.weight");
     R(ad_out_b, "llm_adapter.out_proj.bias");
     R(ad_norm, "llm_adapter.norm.weight");

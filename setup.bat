@@ -4,6 +4,9 @@ rem   Node.js (a portable copy, only if a recent one isn't installed), the engin
 rem   built from source with --build), the CUDA runtime, and the Anima models + turbo LoRA,
 rem   plus the 4x upscaler and the face detector (skip those with --no-extras).
 rem Safe to re-run: finished steps are skipped and interrupted downloads resume.
+rem With no arguments it asks what to get. Or: setup.bat all ^| prereqs ^| models ^| anima te vae turbo
+rem upscaler face engine cublas, setup.bat --list (links + folders, to download by hand),
+rem setup.bat --from "D:\ComfyUI\models" (reuse files you already have).
 setlocal
 title Kiln setup
 cd /d "%~dp0"

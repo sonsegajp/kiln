@@ -4,6 +4,7 @@
 #include <cmath>
 
 void TextEncoder::load(const std::string& path, Place place) {
+    struct MapOk { MapOk() { G.file_map_ok = true; } ~MapOk() { G.file_map_ok = false; } } map_ok;  // st stays open: mapped weights point into it
     st = std::make_unique<SafeTensors>(path);
     auto W = [&](const std::string& n) { return upload_weight(st->get(n), place); };
     embed = &st->get("model.embed_tokens.weight");
