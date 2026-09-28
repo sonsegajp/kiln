@@ -468,6 +468,12 @@ int main(int argc, char** argv) {
     Engine E;
     try {
         gpu_init(device);
+        {
+            char b[320];
+            snprintf(b, sizeof b, "GPU: %s (sm_%d, %.1f GB): %s (%s)", G.gpu_name.c_str(), G.sm, G.vram_total / 1073741824.0,
+                     G.tc ? "tensor-core kernels ON" : "CUDA-core fp16x2 kernels", G.tc_reason.c_str());
+            log_msg(b);
+        }
         G.reserve_bytes = reserve_mb << 20;
         if (vram_budget_mb) {
             // share the card with another app (a game, a local LLM): Kiln uses at most this much VRAM; what doesn't
@@ -501,7 +507,7 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
     std::string gpu_name = prop.name;
-    emit("{\"ev\":\"ready\",\"gpu\":" + json_escape(gpu_name) + "}");
+    emit("{\"ev\":\"ready\",\"gpu\":" + json_escape(gpu_name) + ",\"tc\":" + (G.tc ? "true" : "false") + "}");
 
     std::mutex mu;
     std::condition_variable cv;
@@ -559,7 +565,7 @@ int main(int argc, char** argv) {
                 if (it->id == id) { queue.erase(it); emit("{\"id\":" + json_escape(id) + ",\"ev\":\"cancelled\"}"); break; }
         } else if (cmd == "info") {
             emit("{\"id\":" + json_escape(id) + ",\"ev\":\"info\",\"gpu\":" + json_escape(gpu_name) + ",\"vram_free_mb\":" + std::to_string(gpu_free_bytes() >> 20) +
-                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"family\":" + json_escape(E.family) + ",\"features\":{\"ext\":true}}");
+                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"family\":" + json_escape(E.family) + ",\"tc\":" + (G.tc ? "true" : "false") + ",\"features\":{\"ext\":true}}");
         } else {
             log_msg("unknown cmd " + cmd);
         }

@@ -1,6 +1,8 @@
 #include "gpu.h"
 #include "hgemm.cuh"
 #include "flash.cuh"
+#include "tcflash.cuh"
+#include "tcgemm.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -57,6 +59,77 @@ std::string prof_report() {
 // ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
+// Times the tensor-core GEMM against the HFMA2 one on a DiT-sized product (ms each, best of 3).
+static bool time_gemms(double& t_tc, double& t_hg) {
+    const int M = 1024, N = 2048, K = 2048;
+    float *A = nullptr, *C = nullptr;
+    uint16_t* W = nullptr;
+    bool ok = cudaMalloc(&A, (size_t)M * K * 4) == cudaSuccess && cudaMalloc(&C, (size_t)M * N * 4) == cudaSuccess &&
+              cudaMalloc(&W, (size_t)N * K * 2) == cudaSuccess;
+    if (ok) {
+        cudaMemset(A, 0, (size_t)M * K * 4);
+        cudaMemset(W, 0, (size_t)N * K * 2);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        auto best = [&](auto fn) {
+            fn();
+            float b = 1e30f;
+            for (int i = 0; i < 3; i++) {
+                cudaEventRecord(e0);
+                fn();
+                cudaEventRecord(e1);
+                cudaEventSynchronize(e1);
+                float ms;
+                cudaEventElapsedTime(&ms, e0, e1);
+                b = std::min(b, ms);
+            }
+            return (double)b;
+        };
+        t_tc = best([&] { tc::launch(C, A, W, M, N, K, 0.f, 0, false); });
+        t_hg = best([&] { hg::launch(C, A, W, M, N, K, 0.f, 0, 1, false); });
+        ok = cudaGetLastError() == cudaSuccess;
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+    }
+    cudaGetLastError();
+    cudaFree(A);
+    cudaFree(C);
+    cudaFree(W);
+    return ok;
+}
+
+// Reads the GPU and picks the fp16 kernels: tensor cores on RTX / Ampere and newer, HFMA2 on the CUDA
+// cores otherwise. Turing is ambiguous (RTX 20xx has tensor cores, GTX 16xx does not, both are sm_75),
+// so there the two GEMMs race on a real-sized product and the faster one wins.
+static void pick_kernels(int device) {
+    cudaDeviceProp p;
+    CK(cudaGetDeviceProperties(&p, device));
+    G.gpu_name = p.name;
+    G.sm = p.major * 10 + p.minor;
+    G.vram_total = p.totalGlobalMem;
+    const char* env = getenv("KILN_TC");
+    char why[160];
+    if (env && *env) {
+        G.tc = env[0] == '1';
+        snprintf(why, sizeof why, "KILN_TC=%s", env);
+    } else if (G.sm >= 80) {
+        G.tc = true;
+        snprintf(why, sizeof why, "sm_%d has tensor cores", G.sm);
+    } else if (G.sm == 75) {
+        double t_tc = 0, t_hg = 0;
+        if (time_gemms(t_tc, t_hg)) {
+            G.tc = t_tc < 0.9 * t_hg;
+            snprintf(why, sizeof why, "tensor cores %.2f ms vs CUDA cores %.2f ms per test GEMM", t_tc, t_hg);
+        } else {
+            snprintf(why, sizeof why, "the GEMM race failed");
+        }
+    } else {
+        snprintf(why, sizeof why, "sm_%d", G.sm);
+    }
+    G.tc_reason = why;
+}
+
 void gpu_init(int device) {
     CK(cudaSetDevice(device));
     CK(cudaSetDeviceFlags(cudaDeviceMapHost));
@@ -67,6 +140,7 @@ void gpu_init(int device) {
     CB(cublasCreate(&G.blas));
     CB(cublasSetStream(G.blas, G.stream));
     CB(cublasSetMathMode(G.blas, CUBLAS_PEDANTIC_MATH));  // plain fp32 FMA, no TF32/fast paths
+    pick_kernels(device);
 }
 
 size_t gpu_free_bytes() {
@@ -357,7 +431,10 @@ static void lora_side(float* y, const float* x, int T, const Weight& W) {
 void linear(float* y, const float* x, int T, const Weight& Win, const Weight* bias, float beta) {
     Weight W = Win;
     if (W.on_host) W.p = (uint16_t*)stage_weight(W.p, W.host, (size_t)W.numel() * 2);
-    if (G.fp16 && hg::eligible(T, (int)W.rows, (int)W.cols)) {
+    if (G.fp16 && G.tc && tc::eligible(T, (int)W.rows, (int)W.cols)) {
+        ProfScope ps("gemm_tc");
+        tc::launch(y, x, W.p, T, (int)W.rows, (int)W.cols, beta, G.stream, W.f16);
+    } else if (G.fp16 && hg::eligible(T, (int)W.rows, (int)W.cols)) {
         ProfScope ps("gemm_fp16");
         hg::launch(y, x, W.p, T, (int)W.rows, (int)W.cols, beta, G.stream, 1, W.f16);
     } else {
@@ -580,6 +657,11 @@ __global__ void k_softmax_rows(float* s, int cols, int rows_per_head, bool causa
 
 void attention(float* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                int Tq, int Tk, int H, int Dh, bool causal, int npad) {
+    if (G.fp16 && G.tc && !causal && tfa::eligible(Dh, ldq, ldk, ldv, ldo)) {
+        ProfScope ps("attention");
+        tfa::launch(out, ldo, q, ldq, k, ldk, v, ldv, Tq, Tk, H, npad, G.stream);
+        return;
+    }
     if (G.fp16 && !causal && fa::eligible(Dh, ldq, ldk, ldv, ldo)) {
         ProfScope ps("attention");
         fa::launch(out, ldo, q, ldq, k, ldk, v, ldv, Tq, Tk, H, npad, G.stream);

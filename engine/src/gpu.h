@@ -75,6 +75,12 @@ struct Gpu {
     bool file_map_ok = false;     // set only while the DiT / text encoder load (their matrices go through linear/matvec)
     bool no_file_map = false;     // the loader marks weights read outside linear() (embedding tables)
     bool fp16 = true;             // fp16x2 GEMMs (fast path); false = exact fp32 cuBLAS everywhere
+    // Tensor-core kernels (tcgemm.cuh, tcflash.cuh) for the fp16 path: picked at startup from the GPU
+    // (gpu_init), overridable with KILN_TC=0/1. Off on cards without tensor cores (GTX 16xx).
+    bool tc = false;
+    std::string gpu_name, tc_reason;
+    int sm = 0;
+    size_t vram_total = 0;
 };
 extern Gpu G;
 
