@@ -3,8 +3,7 @@
 // UI, engine source, tools, bundled extension packs, docs), the prebuilt engine and its CUDA runtime DLL,
 // and setup.bat, which downloads the rest (portable Node if needed, NVIDIA's cuBLAS, the models).
 // Never included: config\ (API keys and local settings), models, outputs, logs.
-//   node tools\make-dist.js [--engine-dir engineuild
-ext]
+//   node tools\make-dist.js [--engine-dir engine\build\next]
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -18,8 +17,7 @@ const SKIP = [/^\.git/, /^local\//, /^bench\//, /^dist\//, /^server\/tests\//, /
 const files = [...new Set([...git('ls-files'), ...git('ls-files', '--others', '--exclude-standard')])]
   .filter((f) => fs.existsSync(path.join(ROOT, f)) && !SKIP.some((re) => re.test(f)));
 // the prebuilt engine: nobody should need Visual Studio to run Kiln
-// (--engine-dir: take it from another folder, e.g. a new build in engineuild
-ext while the old one runs)
+// (--engine-dir: take it from another folder, e.g. a new build in engine\build\next while the old one runs)
 const ai = process.argv.indexOf('--engine-dir');
 const ENGINE_DIR = path.resolve(ROOT, ai > 0 && process.argv[ai + 1] ? process.argv[ai + 1] : 'engine/build');
 const ENGINE = ['kiln-engine.exe', 'cudart64_13.dll'];
