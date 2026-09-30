@@ -16,8 +16,10 @@ namespace tfa {
 
 constexpr int D = 128, BR = 64, BC = 64, LDS = D + 8;  // padded rows: conflict-free ldmatrix
 
+// OutT = float, or __half for the fp16-activation forward path (the next GEMM reads fp16 anyway)
+template <typename OutT>
 __global__ void __launch_bounds__(128, 2)
-k_flash(float* __restrict__ out, int ldo, const float* __restrict__ q, int ldq, const float* __restrict__ k, int ldk,
+k_flash(OutT* __restrict__ out, int ldo, const float* __restrict__ q, int ldq, const float* __restrict__ k, int ldk,
         const float* __restrict__ v, int ldv, int Tq, int Tk, float qscale, int npad) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half (*Ks)[LDS] = reinterpret_cast<__half (*)[LDS]>(smem_raw);  // [BC][LDS]; holds Q first
@@ -145,23 +147,26 @@ k_flash(float* __restrict__ out, int ldo, const float* __restrict__ q, int ldq, 
         const float inv = scale / l[r];
         const int row = q0 + warp * 16 + g + 8 * r;
         if (row >= Tq) continue;
-        float* dst = out + (size_t)row * ldo + 2 * t;
+        OutT* dst = out + (size_t)row * ldo + 2 * t;
 #pragma unroll
-        for (int j = 0; j < 16; j++)
-            *reinterpret_cast<float2*>(dst + j * 8) = make_float2(o[j][2 * r] * inv, o[j][2 * r + 1] * inv);
+        for (int j = 0; j < 16; j++) {
+            if constexpr (sizeof(OutT) == 4) *reinterpret_cast<float2*>(dst + j * 8) = make_float2(o[j][2 * r] * inv, o[j][2 * r + 1] * inv);
+            else *reinterpret_cast<__half2*>(dst + j * 8) = __floats2half2_rn(o[j][2 * r] * inv, o[j][2 * r + 1] * inv);
+        }
     }
 }
 
 constexpr size_t SMEM = (size_t)2 * BC * LDS * sizeof(__half);
 
-inline void launch(float* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+template <typename OutT>
+inline void launch(OutT* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                    int Tq, int Tk, int H, int npad, cudaStream_t s) {
     const float qscale = 1.4426950408889634f / sqrtf((float)D);
     dim3 grid((Tq + BR - 1) / BR, H);
-    k_flash<<<grid, 128, SMEM, s>>>(out, ldo, q, ldq, k, ldk, v, ldv, Tq, Tk, qscale, npad);
+    k_flash<OutT><<<grid, 128, SMEM, s>>>(out, ldo, q, ldq, k, ldk, v, ldv, Tq, Tk, qscale, npad);
 }
 
-// Every row pointer must be 16-byte aligned (float4 loads); ldo even (float2 stores).
+// Every row pointer must be 16-byte aligned (float4 loads); ldo even (float2 / half2 stores).
 inline bool eligible(int Dh, int ldq, int ldk, int ldv, int ldo) {
     return Dh == D && ldq % 4 == 0 && ldk % 4 == 0 && ldv % 4 == 0 && ldo % 2 == 0;
 }

@@ -507,7 +507,10 @@ struct Engine {
             std::sort(host.begin(), host.end(), [](Weight* a, Weight* b) { return a->numel() > b->numel(); });
             int moved = 0;
             for (Weight* w : host) moved += promote_weight(*w, ((size_t)256 << 20) + G.leave_free);
-            if (moved) log_msg("moved " + std::to_string(moved) + " of " + std::to_string(host.size()) + " DiT tensors from system RAM back to VRAM");
+            if (moved) {
+                dit.half_weights();  // tensor-core GPUs keep the block weights in VRAM as fp16
+                log_msg("moved " + std::to_string(moved) + " of " + std::to_string(host.size()) + " DiT tensors from system RAM back to VRAM");
+            }
         }
     }
 

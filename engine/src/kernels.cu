@@ -3,6 +3,7 @@
 #include "flash.cuh"
 #include "tcflash.cuh"
 #include "tcgemm.cuh"
+#include "tcgemm16.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,28 @@ std::string prof_report() {
 // ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
+// ms of fn() on the legacy stream, best of 3 after one warm-up run
+template <typename F>
+static double best_ms(F fn) {
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    fn();
+    float b = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        cudaEventRecord(e0);
+        fn();
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms;
+        cudaEventElapsedTime(&ms, e0, e1);
+        b = std::min(b, ms);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    return (double)b;
+}
+
 // Times the tensor-core GEMM against the HFMA2 one on a DiT-sized product (ms each, best of 3).
 static bool time_gemms(double& t_tc, double& t_hg) {
     const int M = 1024, N = 2048, K = 2048;
@@ -69,32 +92,60 @@ static bool time_gemms(double& t_tc, double& t_hg) {
     if (ok) {
         cudaMemset(A, 0, (size_t)M * K * 4);
         cudaMemset(W, 0, (size_t)N * K * 2);
-        cudaEvent_t e0, e1;
-        cudaEventCreate(&e0);
-        cudaEventCreate(&e1);
-        auto best = [&](auto fn) {
-            fn();
-            float b = 1e30f;
-            for (int i = 0; i < 3; i++) {
-                cudaEventRecord(e0);
-                fn();
-                cudaEventRecord(e1);
-                cudaEventSynchronize(e1);
-                float ms;
-                cudaEventElapsedTime(&ms, e0, e1);
-                b = std::min(b, ms);
-            }
-            return (double)b;
-        };
-        t_tc = best([&] { tc::launch(C, A, W, M, N, K, 0.f, 0, false); });
-        t_hg = best([&] { hg::launch(C, A, W, M, N, K, 0.f, 0, 1, false); });
+        t_tc = best_ms([&] { tc::launch(C, A, W, M, N, K, 0.f, 0, false); });
+        t_hg = best_ms([&] { hg::launch(C, A, W, M, N, K, 0.f, 0, 1, false); });
         ok = cudaGetLastError() == cudaSuccess;
-        cudaEventDestroy(e0);
-        cudaEventDestroy(e1);
     }
     cudaGetLastError();
     cudaFree(A);
     cudaFree(C);
+    cudaFree(W);
+    return ok;
+}
+
+// Times the fp32-input tensor-core GEMM (tcgemm.cuh) against the fp16-input one (tcgemm16.cuh) on a q/k/v-sized
+// product of a 512x768 render, both with fp16 weights as the DiT has them on this path (ms each, best of 3).
+// It also checks the fp16-input kernel on this very GPU: with inputs that are exact in fp16, both kernels see the
+// same operands and accumulate in the same order, so `same` is false if a single output bit differs.
+static bool time_tc16(double& t_f32in, double& t_f16in, bool& same) {
+    const int M = 1536, N = 2048, K = 2048;
+    float *A = nullptr, *C = nullptr, *C16 = nullptr;
+    __half* A16 = nullptr;
+    uint16_t* W = nullptr;
+    same = false;
+    bool ok = cudaMalloc(&A, (size_t)M * K * 4) == cudaSuccess && cudaMalloc(&A16, (size_t)M * K * 2) == cudaSuccess &&
+              cudaMalloc(&C, (size_t)M * N * 4) == cudaSuccess && cudaMalloc(&C16, (size_t)M * N * 4) == cudaSuccess &&
+              cudaMalloc(&W, (size_t)N * K * 2) == cudaSuccess;
+    if (ok) {
+        // pseudo-random activations in [-1, 1) and weights in [-0.02, 0.02), rounded to fp16
+        std::vector<float> ha((size_t)M * K);
+        std::vector<__half> ha16(ha.size()), hw((size_t)N * K);
+        uint32_t r = 12345;
+        auto next = [&] { r = r * 1664525u + 1013904223u; return (float)(r >> 8) / 8388608.f - 1.f; };
+        for (size_t i = 0; i < ha.size(); i++) { ha16[i] = __float2half_rn(next()); ha[i] = __half2float(ha16[i]); }
+        for (auto& w : hw) w = __float2half_rn(0.02f * next());
+        ok = cudaMemcpy(A, ha.data(), ha.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(A16, ha16.data(), ha16.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(W, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (ok) {
+        tc16::Args a;
+        a.A = A16; a.W = (const __half*)W; a.K = K; a.C = C16; a.ldc = N; a.M = M; a.N = N;
+        t_f32in = best_ms([&] { tc::launch(C, A, W, M, N, K, 0.f, 0, true); });
+        t_f16in = best_ms([&] { tc16::launch<tc16::EPI_F32>(a, 0, G.sm); });
+        ok = cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess;
+        if (ok) {
+            std::vector<uint32_t> c1((size_t)M * N), c2(c1.size());
+            ok = cudaMemcpy(c1.data(), C, c1.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 cudaMemcpy(c2.data(), C16, c2.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+            same = ok && c1 == c2;
+        }
+    }
+    cudaGetLastError();
+    cudaFree(A);
+    cudaFree(A16);
+    cudaFree(C);
+    cudaFree(C16);
     cudaFree(W);
     return ok;
 }
@@ -128,6 +179,28 @@ static void pick_kernels(int device) {
         snprintf(why, sizeof why, "sm_%d", G.sm);
     }
     G.tc_reason = why;
+
+    // the fp16-activation path runs on the tensor-core kernels; keep it unless its GEMM is clearly slower
+    const char* env16 = getenv("KILN_TC16");
+    if (!G.tc) {
+        G.tc16 = false;
+        snprintf(why, sizeof why, "needs the tensor-core kernels");
+    } else if (env16 && *env16) {
+        G.tc16 = env16[0] == '1';
+        snprintf(why, sizeof why, "KILN_TC16=%s", env16);
+    } else {
+        double t32 = 0, t16 = 0;
+        bool same = false;
+        if (time_tc16(t32, t16, same)) {
+            G.tc16 = same && t16 <= 1.05 * t32;
+            if (!same) snprintf(why, sizeof why, "its GEMM did not reproduce the fp32-input one on this GPU; please report it");
+            else snprintf(why, sizeof why, "fp16-input GEMM %.2f ms vs fp32-input %.2f ms per test GEMM, results identical", t16, t32);
+        } else {
+            G.tc16 = false;
+            snprintf(why, sizeof why, "the fp16 GEMM race failed");
+        }
+    }
+    G.tc16_reason = why;
 }
 
 void gpu_init(int device) {
@@ -141,6 +214,10 @@ void gpu_init(int device) {
     CB(cublasSetStream(G.blas, G.stream));
     CB(cublasSetMathMode(G.blas, CUBLAS_PEDANTIC_MATH));  // plain fp32 FMA, no TF32/fast paths
     pick_kernels(device);
+    if (G.tc) {  // the fp16 path's LoRA down-projections (tensor cores allowed: fp16 inputs, fp32 accumulation)
+        CB(cublasCreate(&G.blas16));
+        CB(cublasSetStream(G.blas16, G.stream));
+    }
 }
 
 size_t gpu_free_bytes() {
@@ -446,6 +523,91 @@ void linear(float* y, const float* x, int T, const Weight& Win, const Weight* bi
     if (bias) add_bias(y, *bias, T, (int)W.rows);
 }
 
+// ---------------------------------------------------------------------------
+// fp16-activation path (G.tc16)
+// ---------------------------------------------------------------------------
+// bf16 -> fp16 (y may be x). Out-of-range values saturate. Inside fp16's range the conversion is exact except
+// below 6e-5 (fp16 subnormals), and it rounds exactly as tcgemm.cuh does while staging bf16 weights.
+__global__ void k_bf16_to_f16(uint16_t* y, const uint16_t* x, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float f = fminf(fmaxf(bfv(x, i), -65504.f), 65504.f);
+    y[i] = __half_as_ushort(__float2half_rn(f));
+}
+
+bool weight_to_f16(Weight& w) {
+    if (w.f16 || w.on_host || !w.p) return false;
+    const size_t n = w.numel();
+    k_bf16_to_f16<<<nblk(n), 256, 0, G.stream>>>(w.p, w.p, n);
+    w.f16 = true;
+    return true;
+}
+
+bool linear16_eligible(const Weight& W) { return tc16::eligible(1, (int)W.rows, (int)W.cols); }
+
+// dst[r * ld + col0 + c] = fp16(scale * src[r, c]) for a bf16 LoRA matrix [rows, cols]
+__global__ void k_lora_pack(__half* dst, int ld, int col0, const uint16_t* src, int rows, int cols, float scale) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * cols) return;
+    const int r = (int)(i / cols), c = (int)(i % cols);
+    dst[(size_t)r * ld + col0 + c] = __float2half_rn(scale * bfv(src, i));
+}
+
+// LoRAs are folded into the GEMM as a second product: t = x A_cat^T (the stacked down-projections, [T, R]),
+// then acc = x W^T + t B_cat^T with B_cat = [s1 B1 | s2 B2 | ...] ([out, R]), so every epilogue (GELU, gated
+// residual) sees the LoRA-adjusted value. R is padded to the k tile with zero rows / columns.
+void linear16(void* y, int ldy, const __half* x16, int T, const Weight& Win, Epi16 epi, const float* gate) {
+    if (!linear16_eligible(Win)) throw std::runtime_error("linear16: the weight is not tensor-core eligible");
+    const int in = (int)Win.cols, out = (int)Win.rows;
+    const uint16_t* wp = Win.p;
+    if (Win.on_host) wp = (const uint16_t*)stage_weight(Win.p, Win.host, (size_t)Win.numel() * 2);
+    if (!Win.f16) {  // still bf16 (in system RAM, or promoted to VRAM after loading): an fp16 copy in G.wbuf
+        const size_t n = Win.numel();
+        if (n > G.wbuf_elems * 2) throw std::runtime_error("weight staging buffer too small");
+        k_bf16_to_f16<<<nblk(n), 256, 0, G.stream>>>((uint16_t*)G.wbuf, wp, n);
+        wp = (const uint16_t*)G.wbuf;
+    }
+    tc16::Args a;
+    a.A = x16; a.W = (const __half*)wp; a.K = in;
+    a.C = y; a.ldc = ldy; a.gate = gate; a.M = T; a.N = out;
+    const size_t m = G.arena.mark();
+    if (Win.lora && !Win.lora->empty()) {
+        ProfScope ps("lora");
+        int R = 0;
+        for (auto& l : *Win.lora) R += (int)l.A.rows;
+        const int R32 = (R + tc16::BK - 1) / tc16::BK * tc16::BK;
+        __half* Ac = (__half*)G.arena.f(((size_t)R32 * in + 1) / 2);
+        __half* Bc = (__half*)G.arena.f(((size_t)out * R32 + 1) / 2);
+        __half* t = (__half*)G.arena.f(((size_t)T * R32 + 1) / 2);
+        if (R32 != R) {
+            CK(cudaMemsetAsync(Ac + (size_t)R * in, 0, (size_t)(R32 - R) * in * 2, G.stream));
+            CK(cudaMemsetAsync(Bc, 0, (size_t)out * R32 * 2, G.stream));
+        }
+        int o = 0;
+        for (auto& l : *Win.lora) {
+            const int r = (int)l.A.rows;
+            k_lora_pack<<<nblk((size_t)r * in), 256, 0, G.stream>>>(Ac + (size_t)o * in, in, 0, l.A.p, r, in, 1.f);
+            k_lora_pack<<<nblk((size_t)out * r), 256, 0, G.stream>>>(Bc, R32, o, l.B.p, out, r, l.scale);
+            o += r;
+        }
+        // t [T, R32] = x16 Ac^T  (column-major: t^T = Ac x16^T)
+        const float one = 1.f, zero = 0.f;
+        CB(cublasGemmEx(G.blas16, CUBLAS_OP_T, CUBLAS_OP_N, R32, T, in, &one, Ac, CUDA_R_16F, in, x16, CUDA_R_16F, in, &zero, t,
+                        CUDA_R_16F, R32, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        a.A2 = t; a.W2 = Bc; a.K2 = R32;
+    }
+    {
+        ProfScope ps("gemm_tc16");
+        switch (epi) {
+            case Epi16::F32: tc16::launch<tc16::EPI_F32>(a, G.stream, G.sm); break;
+            case Epi16::F16: tc16::launch<tc16::EPI_F16>(a, G.stream, G.sm); break;
+            case Epi16::Gelu16: tc16::launch<tc16::EPI_GELU16>(a, G.stream, G.sm); break;
+            case Epi16::Resid: tc16::launch<tc16::EPI_RESID>(a, G.stream, G.sm); break;
+        }
+    }
+    G.arena.release(m);
+}
+
 __global__ void k_matvec(float* y, const uint16_t* W, const float* x, const float* add, int rows, int cols) {
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
     int lane = threadIdx.x & 31;
@@ -510,21 +672,29 @@ void rmsnorm(float* y, const float* x, const Weight* w, int rows, int dim, float
     else k_rmsnorm_block<<<rows, 256, 0, G.stream>>>(y, x, wp, dim, eps);
 }
 
-__global__ void k_layernorm_mod(float* y, const float* x, const float* scale, const float* shift, int dim, float eps) {
+__device__ __forceinline__ void put(float* p, float v) { *p = v; }
+__device__ __forceinline__ void put(__half* p, float v) { *p = __float2half_rn(v); }
+
+template <typename T>
+__global__ void k_layernorm_mod(T* y, const float* x, const float* scale, const float* shift, int dim, float eps) {
     const float* xr = x + (size_t)blockIdx.x * dim;
-    float* yr = y + (size_t)blockIdx.x * dim;
+    T* yr = y + (size_t)blockIdx.x * dim;
     float s = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) s += xr[i];
     float mean = block_sum(s) / dim;
     float v = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) { float d = xr[i] - mean; v += d * d; }
     float r = rsqrtf(block_sum(v) / dim + eps);
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = (xr[i] - mean) * r * (1.f + scale[i]) + shift[i];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) put(yr + i, (xr[i] - mean) * r * (1.f + scale[i]) + shift[i]);
 }
 
 void layernorm_mod(float* y, const float* x, const float* scale, const float* shift, int rows, int dim, float eps) {
     ProfScope ps("norm");
-    k_layernorm_mod<<<rows, 256, 0, G.stream>>>(y, x, scale, shift, dim, eps);
+    k_layernorm_mod<float><<<rows, 256, 0, G.stream>>>(y, x, scale, shift, dim, eps);
+}
+void layernorm_mod16(__half* y, const float* x, const float* scale, const float* shift, int rows, int dim, float eps) {
+    ProfScope ps("norm");
+    k_layernorm_mod<__half><<<rows, 256, 0, G.stream>>>(y, x, scale, shift, dim, eps);
 }
 
 __global__ void k_add_gated(float* x, const float* y, const float* gate, size_t n, int dim) {
@@ -693,6 +863,13 @@ void attention(float* out, int ldo, const float* q, int ldq, const float* k, int
         }
     }
     G.arena.release(m);
+}
+
+void attention16(__half* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+                 int Tq, int Tk, int H, int Dh, int npad) {
+    if (!tfa::eligible(Dh, ldq, ldk, ldv, ldo)) throw std::runtime_error("attention16: unsupported head size or row stride");
+    ProfScope ps("attention");
+    tfa::launch(out, ldo, q, ldq, k, ldk, v, ldv, Tq, Tk, H, npad, G.stream);
 }
 
 // ---------------------------------------------------------------------------

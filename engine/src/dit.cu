@@ -88,6 +88,16 @@ void Dit::load(const std::string& path, Place place) {
     R(ad_out, "llm_adapter.out_proj.weight");
     R(ad_out_b, "llm_adapter.out_proj.bias");
     R(ad_norm, "llm_adapter.norm.weight");
+    half_weights();
+}
+
+// With tensor cores, the blocks' GEMM weights are stored as fp16: the tensor-core kernels read fp16 either way
+// (tcgemm.cuh converts bf16 while staging), and the fp16-activation path streams them with cp.async as they are.
+void Dit::half_weights() {
+    if (!G.tc) return;
+    for (auto& b : blocks)
+        for (Weight* w : {&b.sa_q, &b.sa_k, &b.sa_v, &b.sa_o, &b.ca_q, &b.ca_k, &b.ca_v, &b.ca_o, &b.mlp1, &b.mlp2})
+            if (linear16_eligible(*w)) weight_to_f16(*w);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,14 +246,22 @@ void Dit::forward(float* out, const float* latent, int Hl, int Wl, float t, cons
 }
 
 // NAG combine, one block per token row: a (Z+) <- alpha*clamp(g) + (1-alpha)*Z+, g = Z+*s - Z-*(s-1)
-__global__ void k_nag(float* a, const float* an, int dim, float s, float tau, float alpha) {
-    float* p = a + (size_t)blockIdx.x * dim;
-    const float* n = an + (size_t)blockIdx.x * dim;
+// (float rows, or fp16 rows on the fp16-activation path; the arithmetic is fp32 either way)
+__device__ __forceinline__ float ld(const float* p) { return *p; }
+__device__ __forceinline__ float ld(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ void st(float* p, float v) { *p = v; }
+__device__ __forceinline__ void st(__half* p, float v) { *p = __float2half_rn(v); }
+
+template <typename T>
+__global__ void k_nag(T* a, const T* an, int dim, float s, float tau, float alpha) {
+    T* p = a + (size_t)blockIdx.x * dim;
+    const T* n = an + (size_t)blockIdx.x * dim;
     __shared__ float red[2][32];
     float lp = 0.f, lg = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float g = p[i] * s - n[i] * (s - 1.f);
-        lp += fabsf(p[i]);
+        const float pi = ld(p + i);
+        float g = pi * s - ld(n + i) * (s - 1.f);
+        lp += fabsf(pi);
         lg += fabsf(g);
     }
     for (int o = 16; o > 0; o >>= 1) { lp += __shfl_xor_sync(0xffffffff, lp, o); lg += __shfl_xor_sync(0xffffffff, lg, o); }
@@ -259,8 +277,9 @@ __global__ void k_nag(float* a, const float* an, int dim, float s, float tau, fl
     float ratio = red[1][0] / fmaxf(red[0][0], 1e-12f);
     float k = ratio > tau ? tau / ratio : 1.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float g = p[i] * s - n[i] * (s - 1.f);
-        p[i] = alpha * g * k + (1.f - alpha) * p[i];
+        const float pi = ld(p + i);
+        float g = pi * s - ld(n + i) * (s - 1.f);
+        st(p + i, alpha * g * k + (1.f - alpha) * pi);
     }
 }
 
@@ -398,6 +417,13 @@ void Dit::forward_batch(float* const* outs, const float* latent, int Hl, int Wl,
         sc->skipped = false;
     }
     const size_t RD = (size_t)R * D;
+    // fp16-activation path (tcgemm16.cuh): GEMM inputs are fp16 (norm, attention and GELU outputs), the o-proj and
+    // MLP-out GEMMs add into the residual stream X themselves, mlp1 applies GELU itself. X, Q, K, V stay fp32.
+    const bool h16 = G.fp16 && G.tc16;
+    __half* N16 = reinterpret_cast<__half*>(N);    // [R, D] in N's space (N is not used on this path)
+    __half* A16 = reinterpret_cast<__half*>(A);    // [R, D] attention output in A's space
+    __half* H16 = reinterpret_cast<__half*>(big);  // [R, 4D] MLP hidden (Q, K, V, A are dead by then)
+    __half* An16 = reinterpret_cast<__half*>(An);
     for (size_t i = 0; i < blocks.size(); i++) {
         if (use_cache && i == 1) {
             // block 0 done: X0 <- this step's block-0 residual; compare with the last full forward's
@@ -420,6 +446,44 @@ void Dit::forward_batch(float* const* outs, const float* latent, int Hl, int Wl,
         }
         auto& bl = blocks[i];
         const float* mo = mods + i * 9 * D;
+        if (h16) {
+            // self-attention
+            layernorm_mod16(N16, X, mo + D, mo, R, D, eps);
+            linear16(Q, D, N16, R, bl.sa_q, Epi16::F32);
+            linear16(K, D, N16, R, bl.sa_k, Epi16::F32);
+            linear16(V, D, N16, R, bl.sa_v, Epi16::F32);
+            rmsnorm(Q, Q, &bl.sa_qn, R * NH, DH, eps);
+            rmsnorm(K, K, &bl.sa_kn, R * NH, DH, eps);
+            for (int b = 0; b < B; b++) {
+                rope_half(Q + b * TD, T, NH, DH, rcos, rsin);
+                rope_half(K + b * TD, T, NH, DH, rcos, rsin);
+                attention16(A16 + b * TD, D, Q + b * TD, D, K + b * TD, D, V + b * TD, D, T, T, NH, DH);
+            }
+            linear16(X, D, A16, R, bl.sa_o, Epi16::Resid, mo + 2 * D);
+            // cross-attention
+            const float* mc = mo + 3 * D;
+            layernorm_mod16(N16, X, mc + D, mc, R, D, eps);
+            linear16(Q, D, N16, R, bl.ca_q, Epi16::F32);
+            rmsnorm(Q, Q, &bl.ca_qn, R * NH, DH, eps);
+            for (int b = 0; b < B; b++) {
+                const float *kk, *vv;
+                kv_for(src[b], *cs[b], bl, i, kk, vv);
+                attention16(A16 + b * TD, D, Q + b * TD, D, kk, D, vv, D, T, src[b].L, NH, DH, src[b].npad);
+            }
+            if (use_nag) {
+                const float *kk, *vv;
+                kv_for(nsrc, *nag.neg, bl, i, kk, vv);
+                attention16(An16, D, Q, D, kk, D, vv, D, T, nsrc.L, NH, DH, nsrc.npad);
+                k_nag<__half><<<(unsigned)T, 256, 0, G.stream>>>(A16, An16, D, nag.scale, nag.tau, nag.alpha);
+            }
+            linear16(X, D, A16, R, bl.ca_o, Epi16::Resid, mc + 2 * D);
+            // MLP
+            const float* mm = mo + 6 * D;
+            layernorm_mod16(N16, X, mm + D, mm, R, D, eps);
+            linear16(H16, F, N16, R, bl.mlp1, Epi16::Gelu16);
+            linear16(X, D, H16, R, bl.mlp2, Epi16::Resid, mm + 2 * D);
+            continue;
+        }
         // self-attention
         layernorm_mod(N, X, mo + D, mo, R, D, eps);
         linear(Q, N, R, bl.sa_q);
@@ -448,7 +512,7 @@ void Dit::forward_batch(float* const* outs, const float* latent, int Hl, int Wl,
             const float *kk, *vv;
             kv_for(nsrc, *nag.neg, bl, i, kk, vv);
             attention(An, D, Q, D, kk, D, vv, D, T, nsrc.L, NH, DH, false, nsrc.npad);
-            k_nag<<<(unsigned)T, 256, 0, G.stream>>>(A, An, D, nag.scale, nag.tau, nag.alpha);
+            k_nag<float><<<(unsigned)T, 256, 0, G.stream>>>(A, An, D, nag.scale, nag.tau, nag.alpha);
         }
         linear(Y, A, R, bl.ca_o);
         add_gated(X, Y, mc + 2 * D, R, D);

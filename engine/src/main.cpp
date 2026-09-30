@@ -90,9 +90,30 @@ static int bench(Engine& E, int W, int H, const std::string& lora) {
     const int n = 4;
     for (int i = 0; i < n; i++) E.dit.forward(v, x, Hl, Wl, 0.9f, ctx);
     gpu_sync();
-    char b[128];
+    char b[160];
     snprintf(b, sizeof b, "%dx%d: %.0f ms/step (avg of %d, cross-KV cached)", W, H, ms_since(t0) / n, n);
     log_msg(b);
+    if (G.tc) {  // the fp16-activation path against the fp32-input tensor-core path, same weights and input
+        const bool keep = G.tc16;
+        double ms[2];
+        std::vector<float> out[2];
+        for (int k = 0; k < 2; k++) {
+            G.tc16 = k == 1;
+            E.dit.forward(v, x, Hl, Wl, 0.9f, ctx);
+            gpu_sync();
+            auto tk = Clock::now();
+            for (int i = 0; i < n; i++) E.dit.forward(v, x, Hl, Wl, 0.9f, ctx);
+            gpu_sync();
+            ms[k] = ms_since(tk) / n;
+            out[k] = dl(v, (size_t)16 * P);
+        }
+        G.tc16 = keep;
+        double d2 = 0, r2 = 0;
+        for (size_t i = 0; i < out[0].size(); i++) { double d = out[1][i] - out[0][i]; d2 += d * d; r2 += (double)out[0][i] * out[0][i]; }
+        snprintf(b, sizeof b, "fp32-input tensor-core path %.0f ms/step, fp16-activation path %.0f ms/step (rel_l2 %.2e); using %s", ms[0], ms[1],
+                 std::sqrt(d2 / std::max(r2, 1e-30)), keep ? "fp16" : "fp32-input");
+        log_msg(b);
+    }
     {   // CFG: two passes vs one batched pass (same context twice is fine for timing)
         float* v2 = G.arena.f((size_t)16 * P);
         E.dit.cache_context(ctx);
@@ -473,6 +494,7 @@ int main(int argc, char** argv) {
             snprintf(b, sizeof b, "GPU: %s (sm_%d, %.1f GB): %s (%s)", G.gpu_name.c_str(), G.sm, G.vram_total / 1073741824.0,
                      G.tc ? "tensor-core kernels ON" : "CUDA-core fp16x2 kernels", G.tc_reason.c_str());
             log_msg(b);
+            if (G.tc) log_msg(std::string("fp16-activation path ") + (G.tc16 ? "ON" : "off") + " (" + G.tc16_reason + ")");
         }
         G.reserve_bytes = reserve_mb << 20;
         if (vram_budget_mb) {
@@ -507,7 +529,7 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
     std::string gpu_name = prop.name;
-    emit("{\"ev\":\"ready\",\"gpu\":" + json_escape(gpu_name) + ",\"tc\":" + (G.tc ? "true" : "false") + "}");
+    emit("{\"ev\":\"ready\",\"gpu\":" + json_escape(gpu_name) + ",\"tc\":" + (G.tc ? "true" : "false") + ",\"tc16\":" + (G.tc16 ? "true" : "false") + "}");
 
     std::mutex mu;
     std::condition_variable cv;

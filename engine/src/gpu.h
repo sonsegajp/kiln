@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "safetensors.h"
@@ -78,7 +79,11 @@ struct Gpu {
     // Tensor-core kernels (tcgemm.cuh, tcflash.cuh) for the fp16 path: picked at startup from the GPU
     // (gpu_init), overridable with KILN_TC=0/1. Off on cards without tensor cores (GTX 16xx).
     bool tc = false;
-    std::string gpu_name, tc_reason;
+    // fp16-activation DiT path on top of tc (tcgemm16.cuh): kept only where its GEMM beats the fp32-input one
+    // (raced at startup), overridable with KILN_TC16=0/1
+    bool tc16 = false;
+    cublasHandle_t blas16 = nullptr;  // default math mode (tensor cores allowed): the fp16 LoRA down-projections
+    std::string gpu_name, tc_reason, tc16_reason;
     int sm = 0;
     size_t vram_total = 0;
 };
@@ -114,9 +119,20 @@ void linear(float* y, const float* x, int T, const Weight& W, const Weight* bias
 // y = W x (+ add), single vector, W read straight from bf16
 void matvec(float* y, const Weight& W, const float* x, const float* add = nullptr);
 
+// ---- fp16-activation path (G.tc16) ----
+// What linear16 does with acc = x16 W^T (+ the weight's LoRAs):
+//   F32: y (fp32) = acc   F16: y (fp16) = acc   Gelu16: y (fp16) = GELU(acc)   Resid: y (fp32) += gate[col] * acc
+enum class Epi16 { F32, F16, Gelu16, Resid };
+// x16 [T, W.cols] fp16; y rows of ldy elements. W must be tensor-core eligible (rows % 128, cols % 32).
+void linear16(void* y, int ldy, const __half* x16, int T, const Weight& W, Epi16 epi, const float* gate = nullptr);
+bool linear16_eligible(const Weight& W);
+// bf16 -> fp16 in place for a weight in VRAM that only linear() / linear16() read; false if it stays as it is
+bool weight_to_f16(Weight& w);
+
 // ---- elementwise / norms ----
 void rmsnorm(float* y, const float* x, const Weight* w, int rows, int dim, float eps);
 void layernorm_mod(float* y, const float* x, const float* scale, const float* shift, int rows, int dim, float eps);
+void layernorm_mod16(__half* y, const float* x, const float* scale, const float* shift, int rows, int dim, float eps);  // fp16 out
 void add_gated(float* x, const float* y, const float* gate, int rows, int dim);  // x += gate*y (gate may be null)
 void add_bias(float* y, const Weight& b, int rows, int dim);
 void scale_rows(float* y, const float* s, int rows, int dim);                    // y[r,:] *= s[r]
@@ -135,6 +151,9 @@ void repeat_kv(float* dst, const float* src, int T, int Hkv, int group, int Dh);
 // npad * exp(0 - max) to the softmax denominator and nothing to the output.
 void attention(float* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                int Tq, int Tk, int H, int Dh, bool causal, int npad = 0);
+// the same on tensor cores with an fp16 output (G.tc16 path; Dh = 128, not causal)
+void attention16(__half* out, int ldo, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+                 int Tq, int Tk, int H, int Dh, int npad = 0);
 
 // ---- image ops, channel-first [C, H*W] ----
 void conv2d(float* out, const float* in, int Cin, int H, int W, const Weight& w, const Weight* b, int ksize);

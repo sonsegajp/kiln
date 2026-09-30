@@ -45,6 +45,8 @@ struct Dit {
     std::vector<std::pair<std::string, Weight*>> named;  // for LoRA lookup, names without prefix
 
     void load(const std::string& path, Place place);
+    // tensor-core GPUs: the blocks' GEMM weights in VRAM -> fp16 (after loading, and after weights move into VRAM)
+    void half_weights();
     // Qwen hidden [Lq,1024] + t5 ids/weights -> cross-attn context [Lc,1024], Lc = max(512, Lt)
     int context_len(int t5_len) const { return t5_len < 512 ? 512 : t5_len; }
     void adapt(const float* qwen_hidden, int Lq, const std::vector<int>& t5_ids, const std::vector<float>& t5_w, float* ctx);
