@@ -30,7 +30,7 @@ const SDXL_ENABLED = process.env.KILN_SDXL === '1';
 // can the running engine build run this model family? (an engine that doesn't report "sdxl" is assumed able)
 const canRunFamily = (fam) => fam === 'anima' || (fam === 'sdxl' && SDXL_ENABLED && !(engineInfo && engineInfo.features && engineInfo.features.sdxl === false));
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const ROOT = path.resolve(__dirname, '..');
 const MODELS = path.resolve(process.env.KILN_MODELS || path.join(ROOT, 'models'));
 const OUTPUTS = path.resolve(process.env.KILN_OUTPUTS || path.join(ROOT, 'outputs'));

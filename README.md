@@ -8,7 +8,7 @@ Its own C++/CUDA inference engine and web UI, built from scratch for cards like 
 Kiln runs diffusion models on its own engine instead of PyTorch. The kernels are written for GPUs
 without tensor cores: fp16x2 (HFMA2) GEMMs and implicit-GEMM convolutions, a fused flash attention,
 and weights kept in their checkpoint precision. On RTX cards, Kiln switches to its own tensor-core
-kernels at launch (new in 1.1, see [Tensor cores](#tensor-cores-rtx-cards)). On a laptop GTX 1660 Ti Max-Q (6 GB, power-capped),
+kernels at launch (new in 1.1, faster in 1.2, see [Tensor cores](#tensor-cores-rtx-cards)). On a laptop GTX 1660 Ti Max-Q (6 GB, power-capped),
 it renders the same seeds several times faster than PyTorch-based UIs.
 
 | Anima, 512x768, turbo LoRA, 8 steps | Time |
@@ -49,8 +49,10 @@ it, and run `setup.bat`. See [Install](#install).
   name, their look and, optionally, their usual outfit.
 - **Samplers and schedulers**: euler, euler ancestral, DPM++ 2M, res multistep and ER SDE, with every
   ComfyUI scheduler. The first-block step cache is optional.
-- **Tensor cores on RTX cards** (new, experimental): Kiln reads the GPU at launch and uses its own
+- **Tensor cores on RTX cards** (experimental): Kiln reads the GPU at launch and uses its own
   tensor-core kernels on RTX 20/30/40/50 cards, with the fast fp16-accumulate mode that PyTorch doesn't use.
+  New in 1.2: the model's activations reach those kernels as fp16, and GELU, residual adds and LoRAs are
+  folded into the matrix multiplies.
 - **Low-VRAM friendly**: weights that don't fit in VRAM stream from system RAM, VAE decodes are
   banded, and the scratch memory regrows automatically.
 - **Phones and tablets**: the web UI works on phones and tablets on the same Wi-Fi.
@@ -259,6 +261,7 @@ The server reads these environment variables. Set them in a terminal before runn
 | `KILN_ENGINE` | `engine\build\kiln-engine.exe` | engine executable |
 | `KILN_SDXL` | off | `1` enables the unfinished SDXL path (slow) |
 | `KILN_TC` | auto | `0` or `1` forces the tensor-core kernels off or on (default: picked from the GPU at launch) |
+| `KILN_TC16` | auto | `0` or `1` forces the fp16-activation path of the tensor-core kernels off or on (default: raced at launch) |
 
 ## Updating
 
@@ -281,7 +284,8 @@ setup.bat
   `KILN_PORT`.
 - **A download failed or was interrupted.** Run `setup.bat` again; it resumes.
 - **Images look wrong on an RTX card** (noise, stripes, black images). The tensor-core kernels are new;
-  set `KILN_TC=0` before `start.bat` to use the CUDA-core kernels, and please open an issue with your GPU.
+  set `KILN_TC16=0` before `start.bat` to turn off the newest (fp16-activation) path, or `KILN_TC=0` to use
+  the CUDA-core kernels, and please open an issue with your GPU.
 - **Something looks corrupted.** Run `setup.bat --verify`. Files that fail the check are downloaded again.
 - **The face detailer or the model upscaler is unavailable.** Its model is missing; run `setup.bat`
   (without `--no-extras`). The note under the option says what's missing.
@@ -498,8 +502,9 @@ that on these cards. Kiln's kernels are built around it.
 
 #### Tensor cores (RTX cards)
 
-New in 1.1 and still experimental: the kernels below are verified for accuracy, but their speed hasn't been
-benchmarked on RTX hardware yet.
+Added in 1.1, extended in 1.2 with the fp16-activation path, and still experimental. The kernels below are
+verified for accuracy, and the 1.2 GEMM re-checks itself against the 1.1 one on every GPU at launch. Their speed
+hasn't been benchmarked on RTX hardware here yet.
 
 - **Picked at launch** (`pick_kernels` in `kernels.cu`): the engine reads the GPU. Ampere and newer (RTX
   30/40/50, sm_80+) use tensor cores. Turing is ambiguous, because RTX 20xx has tensor cores and GTX 16xx
@@ -522,6 +527,25 @@ benchmarked on RTX hardware yet.
   - Measured error: 6.9×10⁻⁴ (the HFMA2 attention: 1.8×10⁻³).
 - **Build**: the engine is compiled for sm_75, sm_80, sm_89 and sm_120, plus compute_80 PTX that other
   GPUs compile on first start.
+- **fp16-activation path** (`tcgemm16.cuh`, `linear16` in `kernels.cu`): on the kernels above, every GEMM
+  still reads fp32 activations and rounds them to fp16 in registers, which rules out Ampere's asynchronous
+  copies and moves twice the bytes. The fp16 path hands the GEMMs fp16 inputs instead:
+  - The norms before each GEMM, the attention output and the MLP's GELU are written as fp16. The residual
+    stream and Q/K/V stay fp32.
+  - The GEMM stages its tiles with `cp.async` through a 4-deep shared-memory ring on sm_80+ and rasterizes
+    blocks in groups of 8 row tiles, so the blocks running at once share weight tiles in L2.
+  - Its epilogue applies GELU (mlp1) or adds `gate × output` into the residual stream (the two output
+    projections and mlp2), so those intermediates are never written in fp32.
+  - LoRAs are folded in as a second product in the same accumulators (`x·A_cat` via cuBLAS, then
+    `[s₁B₁ | s₂B₂ | …]`), instead of the exact-fp32 cuBLAS side path. So the GELU and the gated residual see
+    the LoRA-adjusted value.
+  - The blocks' GEMM weights are stored as fp16 on tensor-core GPUs. The tensor-core kernels read fp16
+    either way, and the conversion is exact for every weight larger than 6×10⁻⁵.
+  - For identical fp16 inputs the GEMM is bit-identical to the one above (`bench/tc16_test.cu`). At launch
+    the two GEMMs race on the same data. The fp16 path is kept unless it is more than 5% slower, or its
+    output differs from the other kernel's by a single bit on that GPU. `--bench` times both forward paths
+    and prints how far apart their outputs are. Without LoRAs they match exactly; LoRAs differ slightly,
+    because the fp16 path runs them in fp16 instead of exact fp32.
 - **Still on the CUDA cores on RTX cards**: the VAE, upscaler and face-detector convolutions.
 - **Tests**: `bench/tc_probe.cu`, `bench/tc_test.cu` and `bench/tfa_test.cu`.
 
