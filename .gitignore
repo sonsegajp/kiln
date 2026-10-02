@@ -41,3 +41,7 @@ __pycache__/
 
 # release zips (tools/make-dist.js)
 /dist/
+
+# training datasets and caches (Datasets tab, LoRA trainer)
+/datasets/
+/cache/

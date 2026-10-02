@@ -56,6 +56,13 @@ it, and run `setup.bat`. See [Install](#install).
 - **Low-VRAM friendly**: weights that don't fit in VRAM stream from system RAM, VAE decodes are
   banded, and the scratch memory regrows automatically.
 - **Phones and tablets**: the web UI works on phones and tablets on the same Wi-Fi.
+- **LoRA training** (new in 1.3): train Anima LoRAs on your own GPU in the **Train** tab, with Character and
+  Style presets, previews rendered the way txt2img renders them (turbo or base), checkpoints every few epochs,
+  tag shuffling, flip, caption dropout and a disk cache that makes reruns start in seconds.
+- **Datasets** (new in 1.3): build and clean up training sets in the **Datasets** tab: a thumbnail grid with a
+  tag editor, bulk edits (trigger tags, add / remove / replace), auto-tagging with the WD v3 taggers (run by
+  Kiln's engine), and **BooruGrab** built in to search Danbooru, Gelbooru, Safebooru, Rule34, e621, Konachan,
+  Yande.re and paheal and download originals with their tags.
 
 **Models**: **Anima only, for now** (Cosmos-Predict2 2B with the Qwen3-0.6B text encoder and the
 Qwen-Image VAE; Anima-based checkpoints and LoRAs work too). SDXL (Illustrious, NoobAI, Pony) already
@@ -209,6 +216,39 @@ Browse with the 🌐 button or the **CivitAI** tab next to Lora and Checkpoints.
 the base model of the checkpoint you have selected (Anima, Illustrious, and so on). Downloads land in
 `models\loras\` or `models\checkpoints\` with their preview images, and are hash-checked.
 
+### Datasets and auto-tagging
+
+The **Datasets** tab holds training sets: folders of images with a `.txt` caption (comma-separated tags)
+of the same name. **New…** makes one in `datasets\`, or open any folder you already have.
+
+- **Grab from boorus** is BooruGrab inside Kiln: search the sites that are on, filter by rating, and
+  download originals plus their tags into the dataset. **Settings…** holds the sites (with API keys for the
+  ones that need them, such as Rule34) and can import an existing BooruGrab `settings.json`. Posts tagged as
+  depicting minors are always skipped unless rated General.
+- **Images & tags**: click an image to edit its tags; Ctrl- and Shift-click select several. Bulk edits put
+  trigger tags first, add, remove or replace tags, on the selection or the whole set. **Remove** moves
+  images into the dataset's `_removed\` folder instead of deleting them.
+- **Auto-tag** runs a WD v3 tagger (EVA02-Large, ViT-Large or ViT, downloaded from Hugging Face on first
+  use) on the engine, with general and character thresholds, and adds to, replaces or only fills empty
+  captions.
+
+### Training LoRAs
+
+The **Train** tab trains an Anima LoRA from a dataset (**Train on this** in Datasets fills it in).
+
+- Pick the checkpoint to **train on**. Rendering with the same checkpoint matches best.
+- **Presets**: *Character* (AdamW 1e-4, rank 8, about 1200 steps) and *Style* (Prodigy, rank 16, 768 px,
+  flip and caption dropout), plus quick-test versions at 512 px. Repeats and epochs follow the image count.
+- **Previews** render every N steps through the same code txt2img uses, with the turbo LoRA or the base
+  settings, so a preview looks like a render with that checkpoint.
+- Checkpoints land in `models\loras\` as `<name>-e<epoch>.safetensors`, the final one as `<name>.safetensors`,
+  and **Stop** saves the current state. Files use the sd-scripts / ComfyUI LoRA format.
+- The first run on a dataset encodes the images and captions once and keeps them in `cache	rain\`; later
+  runs on the same images start almost at once.
+
+Training uses the GPU the renders use, so renders queue behind it. On a 6 GB card, 512 px trains at about
+4.5 s a step.
+
 ### Nodes and packs
 
 **Nodes** is a node editor for building your own pipelines. Drop in a ComfyUI workflow (API or UI JSON,
@@ -238,6 +278,9 @@ the PC itself. If Windows asks whether Node.js may use the network, allow privat
 | `workflows\` | node workflows you've saved |
 | `config\` | settings and your CivitAI key |
 | `extensions\` | installed packs |
+| `datasets\` | training datasets made in the Datasets tab |
+| `models	aggers\` | the WD taggers for auto-tagging |
+| `cache\` | thumbnails and the trainer's encoded images and captions |
 
 None of these are tracked by git except the bundled example packs, so updating never touches your
 models, renders or key.
