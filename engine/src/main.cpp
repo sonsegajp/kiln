@@ -11,11 +11,15 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <thread>
 
 #include "engine.h"
 #include "graph.h"
+#include "train.h"
+#include "train_job.h"
+#include "tag_job.h"
 
 #include <fcntl.h>
 #include <io.h>
@@ -210,6 +214,155 @@ static int bench_sdxl(Engine& E, const std::string& ckpt, int W, int H) {
     while (std::getline(ss2, line)) log_msg(line);
     G.arena.release(m);
     Sdxl::free_cond(c);
+    return 0;
+}
+
+// LoRA training against ref/anima_train_ref.py's goldens (<dir>): one block's forward and backward (output, input
+// gradient, every LoRA gradient), then a training step through patchify, two blocks, the final layer and the loss.
+static std::vector<float> read_f32(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("cannot read " + path);
+    std::vector<float> v((size_t)f.tellg() / 4);
+    f.seekg(0);
+    f.read((char*)v.data(), v.size() * 4);
+    return v;
+}
+static double compare(const std::string& what, const std::vector<float>& got, const std::vector<float>& want) {
+    if (got.size() != want.size()) { log_msg(what + ": size mismatch"); return 1e9; }
+    double d2 = 0, r2 = 0, mx = 0;
+    for (size_t i = 0; i < got.size(); i++) {
+        const double d = (double)got[i] - want[i];
+        d2 += d * d;
+        r2 += (double)want[i] * want[i];
+        mx = std::max(mx, std::fabs(d));
+    }
+    const double rel = std::sqrt(d2 / std::max(r2, 1e-30));
+    char b[240];
+    snprintf(b, sizeof b, "%-34s rel_l2 %.3e  max|d| %.3e", what.c_str(), rel, mx);
+    log_msg(b);
+    return rel;
+}
+static float* upload(const std::vector<float>& h) {
+    float* d = G.arena.f(h.size());
+    CK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    return d;
+}
+static int train_selftest(Engine& E, const std::string& dir) {
+    const std::string d = dir + "\\";
+    const int Hl = 16, Wl = 12, Hp = Hl / 2, Wp = Wl / 2, T = Hp * Wp, Lc = 20;
+    const float t = 0.6f;
+    AnimaTrainer tr(E.dit);
+    auto set_lora = [&](const std::string& set, int b) {
+        for (int k = 0; k < AnimaTrainer::NT; k++) {
+            auto& l = tr.lora[b][k];
+            const std::string p = d + set + "_lora" + std::to_string(b) + "_" + AnimaTrainer::kShort[k];
+            auto a = read_f32(p + "_A.f32"), bb = read_f32(p + "_B.f32");
+            CK(cudaMemcpy(l.A, a.data(), a.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(l.B, bb.data(), bb.size() * 4, cudaMemcpyHostToDevice));
+        }
+    };
+    auto check_grads = [&](const std::string& set, int b, const std::string& tag) {
+        double worst = 0;
+        for (int k = 0; k < AnimaTrainer::NT; k++) {
+            auto& l = tr.lora[b][k];
+            const std::string p = d + set + "_lora" + std::to_string(b) + "_" + AnimaTrainer::kShort[k];
+            const std::string nm = tag + " blk" + std::to_string(b) + " " + AnimaTrainer::kShort[k];
+            worst = std::max(worst, compare(nm + " dA", dl(l.dA, (size_t)tr.rank * l.in), read_f32(p + "_dA.f32")));
+            worst = std::max(worst, compare(nm + " dB", dl(l.dB, (size_t)l.out * tr.rank), read_f32(p + "_dB.f32")));
+        }
+        return worst;
+    };
+    const size_t m = G.arena.mark();
+    // the context: 20 real rows of the 512 the adapter pads to
+    Context c;
+    c.p = G.arena.f((size_t)512 * 1024);
+    fill(c.p, 0.f, (size_t)512 * 1024);
+    auto hc = read_f32(d + "blk_ctx.f32");
+    CK(cudaMemcpy(c.p, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice));
+    c.len = 512;
+    c.real = Lc;
+    for (int exact = 1; exact >= 0; exact--) {
+        const bool keep = G.fp16;
+        G.fp16 = !exact;
+        const std::string tag = exact ? "[fp32]" : "[fast]";
+        // one block
+        tr.init(4, 4.f, 1);
+        set_lora("blk", 0);
+        tr.zero_grad();
+        const size_t mb = G.arena.mark();
+        float* X = upload(read_f32(d + "blk_x.f32"));
+        float* dY = upload(read_f32(d + "blk_g.f32"));
+        float* dX = G.arena.f((size_t)T * 2048);
+        tr.test_block(0, X, dY, dX, Hp, Wp, t, c);
+        compare(tag + " block output", dl(X, (size_t)T * 2048), read_f32(d + "blk_y.f32"));
+        compare(tag + " block input gradient", dl(dX, (size_t)T * 2048), read_f32(d + "blk_dx.f32"));
+        log_msg(tag + " worst LoRA gradient rel_l2 " + std::to_string(check_grads("blk", 0, tag)));
+        G.arena.release(mb);
+        // a training step through two blocks
+        tr.init(4, 4.f, 1);
+        set_lora("chain", 0);
+        set_lora("chain", 1);
+        tr.zero_grad();
+        float* lat = upload(read_f32(d + "chain_lat.f32"));
+        float* noise = upload(read_f32(d + "chain_noise.f32"));
+        auto t0 = Clock::now();
+        const float loss = tr.step(lat, noise, Hl, Wl, t, c, 1.f, 2);
+        gpu_sync();
+        std::ifstream mf(d + "chain_pred.json");
+        std::stringstream ss;
+        ss << mf.rdbuf();
+        const Json meta = Json::parse(ss.str());
+        char b[160];
+        snprintf(b, sizeof b, "%s chain loss %.6f (reference %.6f), step %d ms", tag.c_str(), loss, meta["loss"].num(0), (int)ms_since(t0));
+        log_msg(b);
+        double w = check_grads("chain", 0, tag);
+        w = std::max(w, check_grads("chain", 1, tag));
+        log_msg(tag + " chain worst LoRA gradient rel_l2 " + std::to_string(w));
+        G.arena.release(mb);
+        G.fp16 = keep;
+    }
+    G.arena.release(m);
+    return 0;
+}
+
+// --train-bench WxH: a few rank-32 training steps on random data at that image size; time per step, where it goes,
+// and the scratch it needs
+static int train_bench(Engine& E, int W, int H, int steps) {
+    const int Hl = H / 8, Wl = W / 8;
+    AnimaTrainer tr(E.dit);
+    tr.init(32, 32.f, 1);
+    log_msg("LoRA rank 32 on " + std::to_string(tr.lora.size() * AnimaTrainer::NT) + " linears: " + std::to_string(tr.n / 1000000.0).substr(0, 5) + "M parameters");
+    const size_t m = G.arena.mark();
+    std::mt19937 rng(1);
+    std::normal_distribution<float> nd;
+    std::vector<float> h((size_t)16 * Hl * Wl);
+    auto rnd = [&](size_t n, float s) { std::vector<float> v(n); for (auto& x : v) x = nd(rng) * s; return v; };
+    float* lat = upload(rnd(h.size(), 1.f));
+    float* noise = upload(rnd(h.size(), 1.f));
+    Context c;
+    c.p = G.arena.f((size_t)512 * 1024);
+    fill(c.p, 0.f, (size_t)512 * 1024);
+    auto hc = rnd((size_t)77 * 1024, 0.5f);
+    CK(cudaMemcpy(c.p, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice));
+    c.len = 512;
+    c.real = 77;
+    G.arena.peak = G.arena.used;
+    for (int i = 0; i < steps; i++) {
+        if (i == steps - 1) prof_enable(true);
+        auto t0 = Clock::now();
+        const float loss = tr.step(lat, noise, Hl, Wl, 0.3f + 0.1f * i, c);
+        gpu_sync();
+        char b[200];
+        snprintf(b, sizeof b, "%dx%d (%d tokens): step %d %.2f s, loss %.4f, scratch peak %zu MB of %zu", W, H, (Hl / 2) * (Wl / 2), i,
+                 ms_since(t0) / 1000.0, loss, G.arena.peak >> 20, G.arena.cap >> 20);
+        log_msg(b);
+    }
+    std::string rep = prof_report();
+    prof_enable(false);
+    std::stringstream ss(rep);
+    std::string line;
+    while (std::getline(ss, line)) log_msg(line);
+    G.arena.release(m);
     return 0;
 }
 
@@ -466,7 +619,7 @@ static Job parse_job(const Json& r) {
 
 int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
-    std::string models = "models", golden, lora, initial_dit;
+    std::string models = "models", golden, lora, initial_dit, train_golden, train_bench_size, train_file, tag_file;
     int device = 0;
     size_t reserve_mb = 1000, vram_budget_mb = 0;
     int bench_w = 0, bench_h = 0;
@@ -480,6 +633,10 @@ int main(int argc, char** argv) {
         else if (a == "--reserve-mb") reserve_mb = std::stoul(next());
         else if (a == "--vram-budget") vram_budget_mb = std::stoul(next());
         else if (a == "--selftest") golden = next();
+        else if (a == "--train-selftest") train_golden = next();
+        else if (a == "--train-bench") train_bench_size = next();
+        else if (a == "--train") train_file = next();
+        else if (a == "--tag") tag_file = next();
         else if (a == "--lora") lora = next();
         else if (a == "--repeat") repeat_file = next();
         else if (a == "--fp32") G.fp16 = false;
@@ -521,6 +678,34 @@ int main(int argc, char** argv) {
         try { return bench(E, bench_w, bench_h, lora); }
         catch (const std::exception& e) { log_msg(std::string("bench failed: ") + e.what()); return 1; }
     }
+    if (!train_file.empty()) {  // run a train job from a file (same JSON as the "train" command), events on stdout
+        try {
+            std::ifstream f(train_file);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            const Json job = Json::parse(ss.str());
+            return trainjob::run(E, job, "cli");
+        } catch (const std::exception& e) { log_msg(std::string("train failed: ") + e.what()); return 1; }
+    }
+    if (!tag_file.empty()) {  // run a tag job from a file (same JSON as the "tag" command), events on stdout
+        try {
+            std::ifstream f(tag_file);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            const Json job = Json::parse(ss.str());
+            return tagjob::run(E, job, "cli");
+        } catch (const std::exception& e) { log_msg(std::string("tag failed: ") + e.what()); return 1; }
+    }
+    if (!train_bench_size.empty()) {
+        int bw = 512, bh = 768;
+        sscanf(train_bench_size.c_str(), "%dx%d", &bw, &bh);
+        try { return train_bench(E, bw, bh, 3); }
+        catch (const std::exception& e) { log_msg(std::string("train bench failed: ") + e.what()); return 1; }
+    }
+    if (!train_golden.empty()) {
+        try { return train_selftest(E, train_golden); }
+        catch (const std::exception& e) { log_msg(std::string("train selftest failed: ") + e.what()); return 1; }
+    }
     if (!golden.empty()) {
         try { return selftest(E, golden, lora); }
         catch (const std::exception& e) { log_msg(std::string("selftest failed: ") + e.what()); return 1; }
@@ -534,7 +719,7 @@ int main(int argc, char** argv) {
     std::mutex mu;
     std::condition_variable cv;
     // one GPU, one worker: generate jobs and node graphs share the queue
-    struct Work { std::string id; Job job; std::shared_ptr<Json> graph; };
+    struct Work { std::string id; Job job; std::shared_ptr<Json> graph, train, tag; };
     std::deque<Work> queue;
     std::string running;
     bool quit = false;
@@ -552,7 +737,19 @@ int main(int argc, char** argv) {
                 E.cancel = false;
             }
             if (w.graph) run_graph(E, *w.graph);
-            else E.generate(w.job);
+            else if (w.train) {
+                try { trainjob::run(E, *w.train, w.id); }
+                catch (const std::exception& e) {
+                    if (E.cancel) emit("{\"id\":" + json_escape(w.id) + ",\"ev\":\"cancelled\"}");
+                    else emit("{\"id\":" + json_escape(w.id) + ",\"ev\":\"error\",\"msg\":" + json_escape(e.what()) + "}");
+                }
+            } else if (w.tag) {
+                try { tagjob::run(E, *w.tag, w.id); }
+                catch (const std::exception& e) {
+                    if (E.cancel) emit("{\"id\":" + json_escape(w.id) + ",\"ev\":\"cancelled\"}");
+                    else emit("{\"id\":" + json_escape(w.id) + ",\"ev\":\"error\",\"msg\":" + json_escape(e.what()) + "}");
+                }
+            } else E.generate(w.job);
             std::lock_guard<std::mutex> lk(mu);
             running.clear();
         }
@@ -567,10 +764,12 @@ int main(int argc, char** argv) {
         try { r = Json::parse(line); }
         catch (const std::exception& e) { log_msg(std::string("bad request: ") + e.what()); continue; }
         std::string cmd = r["cmd"].str(), id = r["id"].str();
-        if (cmd == "generate" || cmd == "graph") {
+        if (cmd == "generate" || cmd == "graph" || cmd == "train" || cmd == "tag") {
             Work w;
             w.id = id;
             if (cmd == "graph") w.graph = std::make_shared<Json>(std::move(r));
+            else if (cmd == "train") w.train = std::make_shared<Json>(std::move(r));
+            else if (cmd == "tag") w.tag = std::make_shared<Json>(std::move(r));
             else w.job = parse_job(r);
             std::lock_guard<std::mutex> lk(mu);
             queue.push_back(std::move(w));
@@ -587,7 +786,7 @@ int main(int argc, char** argv) {
                 if (it->id == id) { queue.erase(it); emit("{\"id\":" + json_escape(id) + ",\"ev\":\"cancelled\"}"); break; }
         } else if (cmd == "info") {
             emit("{\"id\":" + json_escape(id) + ",\"ev\":\"info\",\"gpu\":" + json_escape(gpu_name) + ",\"vram_free_mb\":" + std::to_string(gpu_free_bytes() >> 20) +
-                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"family\":" + json_escape(E.family) + ",\"tc\":" + (G.tc ? "true" : "false") + ",\"features\":{\"ext\":true}}");
+                 ",\"arena_mb\":" + std::to_string(G.arena.cap >> 20) + ",\"family\":" + json_escape(E.family) + ",\"tc\":" + (G.tc ? "true" : "false") + ",\"features\":{\"ext\":true,\"train\":true,\"tag\":true}}");
         } else {
             log_msg("unknown cmd " + cmd);
         }

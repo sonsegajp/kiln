@@ -61,7 +61,7 @@
   const emit = (name, detail) => bus.dispatchEvent(new CustomEvent(name, { detail }));
 
   // ---------------------------------------------------------------- tabs
-  const TABS = ['txt2img', 'img2img', 'extras', 'pnginfo', 'nodes', 'settings'];
+  const TABS = ['txt2img', 'img2img', 'extras', 'pnginfo', 'datasets', 'train', 'nodes', 'settings'];
   async function setTab(tab) {
     if (tab === 'simple') tab = 'txt2img';
     if (!TABS.includes(tab)) tab = 'txt2img';
@@ -144,7 +144,7 @@
     let label = 'Idle';
     if (S.running) {
       const r = S.running;
-      label = r.kind === 'graph' ? (r.step ? `Graph · step ${r.step}/${r.of}` : r.swap ? 'Loading model' : 'Graph running') : r.step ? stageLabel(r.stage, r.face, r.step, r.of) : r.swap ? 'Loading model' : 'Starting';
+      label = r.kind === 'tag' ? `Tagging · ${r.step || 0}/${r.of}` : r.kind === 'train' ? (r.step ? `Training · step ${r.step}/${r.of}` : 'Training · preparing') : r.kind === 'graph' ? (r.step ? `Graph · step ${r.step}/${r.of}` : r.swap ? 'Loading model' : 'Graph running') : r.step ? stageLabel(r.stage, r.face, r.step, r.of) : r.swap ? 'Loading model' : 'Starting';
       if (S.queued.length) label += ` · ${S.queued.length} queued`;
     } else if (S.queued.length) label = `${S.queued.length} queued`;
     $('queueLabel').textContent = label;
@@ -156,7 +156,7 @@
       const li = el('li', j.status === 'running' ? 'running' : '');
       const stTxt = j.status === 'running' ? (j.step ? (j.stage === 'hires' ? 'H ' : j.stage === 'face' ? `F${j.face || 1} ` : '') + `${j.step}/${j.of}` : 'start') : `#${j.position || ''}`;
       const p = j.params || {};
-      const txt = el('span', 'q-text', j.kind === 'graph' ? `Graph · ${p.nodes} nodes — ${p.prompt || '(no prompt)'}` : `${p.width}×${p.height} · ${p.steps} st · seed ${p.seed} — ${p.prompt || '(empty prompt)'}`);
+      const txt = el('span', 'q-text', j.kind === 'tag' ? `Auto-tag · ${p.images} images with ${p.model}` : j.kind === 'train' ? `Train LoRA · ${p.name} — ${p.images} images, ${p.epochs} epochs` : j.kind === 'graph' ? `Graph · ${p.nodes} nodes — ${p.prompt || '(no prompt)'}` : `${p.width}×${p.height} · ${p.steps} st · seed ${p.seed} — ${p.prompt || '(empty prompt)'}`);
       txt.title = p.prompt || '';
       const x = el('button', 'q-x', '✕');
       x.type = 'button';
@@ -272,6 +272,8 @@
       let m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m.type === 'job') mergeJob(m.job);
+      if (m.type === 'train' && S.running && S.running.id === m.id && S.running.step !== m.step) { S.running.step = m.step; S.running.of = m.of; renderQueue(); }
+      if (m.type === 'autotag' && S.running && S.running.id === m.id) { S.running.step = m.done; renderQueue(); }
       try { window.dispatchEvent(new CustomEvent('kiln:sse', { detail: m })); } catch (_) { /* a tab's handler failed */ }
       switch (m.type) {
         case 'hello': {

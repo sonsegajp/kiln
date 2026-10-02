@@ -59,6 +59,11 @@ struct Dit {
     void drop_context_cache() { for (auto& s : kv) s = KVCache(); }
     // latent [16, Hl, Wl] (model space) at timestep t -> velocity [16, Hl, Wl]
     void forward(float* out, const float* latent, int Hl, int Wl, float t, const Context& c);
+    // timestep t -> every block's adaLN modulation mods [blocks][9][2048] (shift, scale, gate for self-attention,
+    // cross-attention, MLP) followed by the final layer's [2][2048]; and the RoPE tables of an Hp x Wp patch grid,
+    // rope [2][Hp*Wp][64] (cos, then sin). Both device buffers are the caller's (the trainer shares them).
+    void step_tables(float t, int Hp, int Wp, float* mods, float* rope);
+    static size_t mods_elems(size_t nblocks) { return nblocks * 9 * 2048 + 2 * 2048; }
     // First-block cache: across the steps of one sampling run, if block 0's residual barely moved since
     // the last full forward, reuse that forward's residual of blocks 1..27 instead of recomputing them.
     struct StepCache {

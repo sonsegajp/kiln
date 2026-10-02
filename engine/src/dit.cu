@@ -239,6 +239,46 @@ size_t Dit::forward_bytes(int Hl, int Wl, int B) {
     return (R * 68 + 3 * R * D + R * 4 * D) * 4 + T * 128 * 4 + ((size_t)16 << 20);
 }
 
+void Dit::step_tables(float t, int Hp, int Wp, float* mods, float* rope) {
+    const float eps = 1e-6f;
+    size_t m = G.arena.mark();
+    // timestep: sinusoid s -> adaLN-LoRA vector (6144) and normalized embedding
+    std::vector<float> sh(D);
+    for (int i = 0; i < D / 2; i++) {
+        float e = expf((float)i * (-logf(10000.f)) / (float)(D / 2));
+        sh[i] = cosf(t * e);
+        sh[i + D / 2] = sinf(t * e);
+    }
+    float* s = G.arena.f(D);
+    float* s1 = G.arena.f(D);
+    float* lora = G.arena.f(3 * D);
+    float* temb = G.arena.f(D);
+    float* h256 = G.arena.f(256);
+    CK(cudaMemcpyAsync(s, sh.data(), D * 4, cudaMemcpyHostToDevice, G.stream));
+    matvec(s1, t_lin1, s);
+    silu(s1, s1, D);
+    matvec(lora, t_lin2, s1);
+    rmsnorm(temb, s, &t_norm, 1, D, eps);
+    silu(temb, temb, D);  // every modulation MLP starts with SiLU
+    for (size_t i = 0; i < blocks.size(); i++) {
+        auto& b = blocks[i];
+        float* mo = mods + i * 9 * D;
+        matvec(h256, b.mod_sa1, temb); matvec(mo, b.mod_sa2, h256, lora);
+        matvec(h256, b.mod_ca1, temb); matvec(mo + 3 * D, b.mod_ca2, h256, lora);
+        matvec(h256, b.mod_mlp1, temb); matvec(mo + 6 * D, b.mod_mlp2, h256, lora);
+    }
+    float* fmod = mods + blocks.size() * 9 * D;
+    matvec(h256, final_mod1, temb);
+    matvec(fmod, final_mod2, h256, lora);
+
+    std::vector<float> rc, rs;
+    cosmos_rope(rc, rs, Hp, Wp);
+    CK(cudaMemcpyAsync(rope, rc.data(), rc.size() * 4, cudaMemcpyHostToDevice, G.stream));
+    CK(cudaMemcpyAsync(rope + rc.size(), rs.data(), rs.size() * 4, cudaMemcpyHostToDevice, G.stream));
+    gpu_sync();  // the host tables go out of scope
+    G.arena.release(m);
+}
+
 void Dit::forward(float* out, const float* latent, int Hl, int Wl, float t, const Context& c) {
     const Context* cs[1] = {&c};
     float* outs[1] = {out};
@@ -334,42 +374,11 @@ void Dit::forward_batch(float* const* outs, const float* latent, int Hl, int Wl,
     const float eps = 1e-6f;
     size_t m = G.arena.mark();
 
-    // timestep: sinusoid s -> adaLN-LoRA vector (6144) and normalized embedding
-    std::vector<float> sh(D);
-    for (int i = 0; i < D / 2; i++) {
-        float e = expf((float)i * (-logf(10000.f)) / (float)(D / 2));
-        sh[i] = cosf(t * e);
-        sh[i + D / 2] = sinf(t * e);
-    }
-    float* s = G.arena.f(D);
-    float* s1 = G.arena.f(D);
-    float* lora = G.arena.f(3 * D);
-    float* temb = G.arena.f(D);
-    float* h256 = G.arena.f(256);
-    float* mods = G.arena.f(blocks.size() * 9 * D + 2 * D);
-    CK(cudaMemcpyAsync(s, sh.data(), D * 4, cudaMemcpyHostToDevice, G.stream));
-    matvec(s1, t_lin1, s);
-    silu(s1, s1, D);
-    matvec(lora, t_lin2, s1);
-    rmsnorm(temb, s, &t_norm, 1, D, eps);
-    silu(temb, temb, D);  // every modulation MLP starts with SiLU
-    for (size_t i = 0; i < blocks.size(); i++) {
-        auto& b = blocks[i];
-        float* mo = mods + i * 9 * D;
-        matvec(h256, b.mod_sa1, temb); matvec(mo, b.mod_sa2, h256, lora);
-        matvec(h256, b.mod_ca1, temb); matvec(mo + 3 * D, b.mod_ca2, h256, lora);
-        matvec(h256, b.mod_mlp1, temb); matvec(mo + 6 * D, b.mod_mlp2, h256, lora);
-    }
+    float* mods = G.arena.f(mods_elems(blocks.size()));
+    float* rope = G.arena.f((size_t)2 * T * (DH / 2));
+    step_tables(t, Hp, Wp, mods, rope);
     float* fmod = mods + blocks.size() * 9 * D;
-    matvec(h256, final_mod1, temb);
-    matvec(fmod, final_mod2, h256, lora);
-
-    std::vector<float> rc, rs;
-    cosmos_rope(rc, rs, Hp, Wp);
-    float* rope = G.arena.f(rc.size() * 2);
-    CK(cudaMemcpyAsync(rope, rc.data(), rc.size() * 4, cudaMemcpyHostToDevice, G.stream));
-    CK(cudaMemcpyAsync(rope + rc.size(), rs.data(), rs.size() * 4, cudaMemcpyHostToDevice, G.stream));
-    const float *rcos = rope, *rsin = rope + rc.size();
+    const float *rcos = rope, *rsin = rope + (size_t)T * (DH / 2);
 
     float* tok = G.arena.f((size_t)R * 68);
     float* X = G.arena.f((size_t)R * D);

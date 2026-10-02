@@ -21,6 +21,9 @@ const A = require('./lib/a1111');
 const SF = require('./lib/sfinfo');
 const { CivitAI } = require('./lib/civitai');
 const { createLibrary } = require('./lib/library');
+const { createDatasets } = require('./lib/datasets');
+const { createTaggers } = require('./lib/taggers');
+const { createGrab } = require('./lib/grab');
 const { encodeSDXL } = require('./lib/clip_tokenize');
 const SDXL_SAMPLERS = ['euler', 'euler_ancestral', 'dpmpp_2m', 'res_multistep'];
 const SDXL_SCHEDULERS = ['normal', 'karras', 'simple', 'sgm_uniform', 'exponential', 'ddim_uniform', 'beta', 'linear_quadratic', 'kl_optimal'];
@@ -30,7 +33,7 @@ const SDXL_ENABLED = process.env.KILN_SDXL === '1';
 // can the running engine build run this model family? (an engine that doesn't report "sdxl" is assumed able)
 const canRunFamily = (fam) => fam === 'anima' || (fam === 'sdxl' && SDXL_ENABLED && !(engineInfo && engineInfo.features && engineInfo.features.sdxl === false));
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const ROOT = path.resolve(__dirname, '..');
 const MODELS = path.resolve(process.env.KILN_MODELS || path.join(ROOT, 'models'));
 const OUTPUTS = path.resolve(process.env.KILN_OUTPUTS || path.join(ROOT, 'outputs'));
@@ -289,7 +292,8 @@ function publicJob(j) {
     step_ms: j.stepMs, encode_ms: j.encodeMs, decode_ms: j.decodeMs, timings: j.timings,
     total_ms: j.totalMs, wall_ms: j.wallMs, image: j.image, error: j.error, loading: j.loading,
     position: j.status === 'queued' ? queue.indexOf(j) + 1 : 0,
-    kind: j.kind || 'generate', swap: j.swap || undefined, error_node: j.errorNode, node: j.node, node_status: j.nodeStatus, outputs: j.outputs, node_ms: j.nodeMs,
+    kind: j.kind || 'generate', swap: j.swap || undefined, train: j.kind === 'train' ? trainView(j) : undefined,
+    tag: j.kind === 'tag' ? { dir: j.tag.opt.dir, failed: j.tag.failed, changed: j.tag.changed } : undefined, error_node: j.errorNode, node: j.node, node_status: j.nodeStatus, outputs: j.outputs, node_ms: j.nodeMs,
   };
 }
 function queueSnapshot() {
@@ -567,12 +571,304 @@ function pump() {
   runJob(j);
 }
 
+// ---------------------------------------------------------------------------
+// LoRA training (Anima): a folder of images with .txt captions -> models/loras/<name>.safetensors, with
+// checkpoints and preview PNGs beside it. The engine runs it as one long job; renders queue behind it.
+// ---------------------------------------------------------------------------
+const TRAIN_IMG_RE = /\.(png|jpe?g|webp|bmp|gif)$/i;
+const LORA_NAME_RE = /^[\w\- .]{1,80}$/;
+function scanDataset(dir) {
+  const abs = path.resolve(String(dir || '').trim() || '.');
+  let names;
+  try { names = fs.readdirSync(abs); } catch (e) { throw new Error('cannot read the folder ' + abs); }
+  const items = [];
+  for (const f of names.sort()) {
+    if (!TRAIN_IMG_RE.test(f)) continue;
+    let caption = '';
+    try { caption = fs.readFileSync(path.join(abs, f.replace(/\.[^.]+$/, '.txt')), 'utf8').trim(); } catch (_) { }
+    items.push({ file: f, image: path.join(abs, f), caption });
+  }
+  return { dir: abs, items };
+}
+// captions are literal text: Kiln's prompt weighting would read "star (sky)" as emphasis
+const literalText = (t) => String(t).replace(/([()[\]])/g, '\\$1');
+
+function validateTrain(b) {
+  const ds = scanDataset(b.dataset);
+  if (!ds.items.length) throw new Error('no images (png, jpg, webp) in ' + ds.dir);
+  const name = String(b.name || '').trim();
+  if (!LORA_NAME_RE.test(name)) throw new Error('give the LoRA a name: letters, digits, spaces, - and _');
+  const trigger = String(b.trigger || '').trim();
+  const optimizer = b.optimizer === 'adamw' ? 'adamw' : 'prodigy';
+  const epochs = Math.round(num(b.epochs, 10, 1, 1000));
+  const repeats = Math.round(num(b.repeats, 1, 1, 1000));  // an epoch shows every image this many times
+  const batch = Math.round(num(b.batch_size, 1, 1, 16));    // images per optimizer step (gradient accumulation)
+  const prompts = String(b.preview_prompt || '').split(/\n+/).map(t => t.trim()).filter(Boolean).slice(0, 4);
+  const on = (v) => v === true || v === 1 || v === 'true' || v === 'on';
+  // previews render like txt2img's quick presets: Turbo (the turbo LoRA, 8 steps, CFG 1, Euler, NAG for the
+  // negative) or Base (20 steps, CFG 4.5, DPM++ 2M, CFG for the first 70% of the steps)
+  const turbo = on(b.preview_turbo);
+  let turboLora = null;
+  if (turbo) {
+    const t = listModels().loras.find(l => /turbo/i.test(l.file));
+    if (!t) throw new Error('turbo previews need the Anima turbo LoRA in models (none found)');
+    turboLora = t.path;
+  }
+  // the Anima checkpoint to train on (empty: the engine's default, anima-base)
+  let model = null;
+  if (typeof b.model === 'string' && b.model.trim()) {
+    const c = listModels().checkpoints.find(x => ['diffusion', 'checkpoint'].includes(x.kind) && (x.file === b.model || x.name === b.model));
+    if (!c) throw new Error('unknown checkpoint: ' + b.model);
+    if (library.describe(c.path).family !== 'anima') throw new Error(c.name + ' is not an Anima model; only Anima LoRAs can be trained');
+    model = { file: c.file, path: c.path };
+  }
+  const pv = turbo ? { steps: 8, cfg: 1, sampler: 'euler', cfg_until: 1, nag: true } : { steps: 20, cfg: 4.5, sampler: 'dpmpp_2m', cfg_until: 0.7, nag: false };
+  return {
+    model, preview_turbo: turbo, preview_turbo_lora: turboLora, preview_sampler: pv.sampler, preview_cfg_until: pv.cfg_until, preview_nag: pv.nag,
+    ds, name, trigger, optimizer, epochs, repeats, batch, steps: epochs * Math.ceil(repeats * ds.items.length / batch),
+    preset: String(b.preset || '').slice(0, 40),
+    shuffle: on(b.shuffle_caption), keep_tokens: Math.round(num(b.keep_tokens, 1, 0, 32)), caption_variants: Math.round(num(b.caption_variants, 4, 1, 32)),
+    caption_dropout: num(b.caption_dropout, 0, 0, 0.9), flip: on(b.flip), noise_offset: num(b.noise_offset, 0, 0, 0.5),
+    timestep_sampling: ['sigmoid', 'shift', 'uniform'].includes(b.timestep_sampling) ? b.timestep_sampling : 'sigmoid',
+    sigmoid_scale: num(b.sigmoid_scale, 1.3, 0.1, 5), flow_shift: num(b.discrete_flow_shift, 3, 0.1, 10),
+    warmup: Math.round(num(b.warmup, 0, 0, 100000)),
+    rank: Math.round(num(b.rank, 32, 1, 256)), alpha: num(b.alpha, num(b.rank, 32, 1, 256), 0.01, 256),
+    lr: num(b.lr, optimizer === 'prodigy' ? 1 : 1e-4, 1e-7, 10),
+    resolution: Math.round(num(b.resolution, 512, 256, 1024) / 64) * 64,
+    save_every_epochs: Math.round(num(b.save_every_epochs, 0, 0, 1000)),
+    preview_every: Math.round(num(b.preview_every, 0, 0, 100000)),
+    prompts, negative: typeof b.preview_negative === 'string' ? b.preview_negative : 'worst quality, low quality, blurry, jpeg artifacts',
+    preview_w: snap16(b.preview_w, 512), preview_h: snap16(b.preview_h, 768),
+    preview_steps: pv.steps, preview_cfg: pv.cfg,
+    seed: Math.round(num(b.seed, 1, 0, 2 ** 31)),
+    out: path.join(MODELS, 'loras', name + '.safetensors'),
+  };
+}
+
+// Tag shuffling (sd-scripts' shuffle_caption + keep_tokens): the first keep_tokens tags (the trigger counts as one) stay
+// put and the rest are shuffled. Captions go through the text encoder once, before training, so each image gets a few
+// shuffled orders up front and the trainer picks one of them every time it shows the image.
+function captionVariants(caption, p, seed) {
+  // the trigger (one or more comma-separated tags) goes in front once: a caption that already has it loses its copy,
+  // and every trigger tag stays put while the rest shuffle
+  const split = (t) => String(t || '').split(',').map(x => x.trim()).filter(Boolean);
+  const norm = (t) => t.toLowerCase().replace(/_/g, ' ').replace(/\\([()])/g, '$1');
+  const trig = split(p.trigger), seen = new Set(trig.map(norm));
+  const all = [...trig, ...split(caption).filter(t => !seen.has(norm(t)))];
+  if (!p.shuffle) return [all.join(', ')];
+  const nkeep = Math.max(p.keep_tokens, trig.length);
+  const keep = all.slice(0, nkeep), rest = all.slice(nkeep);
+  let st = seed >>> 0;
+  const rand = () => {  // mulberry32: the same variants for the same seed
+    st = (st + 0x6D2B79F5) >>> 0;
+    let t = st;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const out = new Set();
+  for (let k = 0; k < p.caption_variants * 4 && out.size < p.caption_variants; k++) {
+    const r = rest.slice();
+    for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; }
+    out.add([...keep, ...r].join(', '));
+  }
+  return [...out];
+}
+
+function createTrainJob(p) {
+  const tok = (t) => { const e = encodePrompt(t); return { qwen_ids: e.qwen_ids, t5_ids: e.t5_ids, t5_weights: e.t5_weights }; };
+  const items = p.ds.items.map((it, i) => {
+    const v = captionVariants(it.caption, p, p.seed * 7919 + i).map(t => tok(literalText(t)));
+    return { image: it.image, ...v[0], variants: v.slice(1) };
+  });
+  const created = Date.now();
+  const j = {
+    id: 'j' + (++jobSeq), group: 'g' + (++groupSeq), index: 0, count: 1, status: 'queued', created, kind: 'train', family: 'anima',
+    params: {
+      kind: 'train', name: p.name, dataset: p.ds.dir, images: p.ds.items.length, trigger: p.trigger, epochs: p.epochs, repeats: p.repeats, batch_size: p.batch, steps: p.steps, preset: p.preset, model: p.model ? p.model.file : '',
+      shuffle_caption: p.shuffle, keep_tokens: p.keep_tokens, caption_dropout: p.caption_dropout, flip: p.flip, noise_offset: p.noise_offset,
+      timestep_sampling: p.timestep_sampling, sigmoid_scale: p.sigmoid_scale, discrete_flow_shift: p.flow_shift, warmup: p.warmup,
+      rank: p.rank, alpha: p.alpha, optimizer: p.optimizer, lr: p.lr, resolution: p.resolution, save_every_epochs: p.save_every_epochs,
+      preview_every: p.preview_every, preview_prompts: p.prompts, preview_turbo: p.preview_turbo, out: path.relative(MODELS, p.out).split(path.sep).join('/'),
+    },
+    trainReq: {
+      items, out: p.out, dit: p.model ? p.model.path : undefined, rank: p.rank, alpha: p.alpha, epochs: p.epochs, repeats: p.repeats, optimizer: p.optimizer, lr: p.lr, resolution: p.resolution,
+      save_every_epochs: p.save_every_epochs, seed: p.seed, grad_clip: 1.0, weight_decay: 0.01, warmup: p.warmup, batch_size: p.batch,
+      timestep_sampling: p.timestep_sampling, sigmoid_scale: p.sigmoid_scale, discrete_flow_shift: p.flow_shift, noise_offset: p.noise_offset,
+      flip: p.flip, caption_dropout: p.caption_dropout, empty_caption: p.caption_dropout > 0 ? tok('') : undefined,
+      shuffle_caption: p.shuffle, keep_tokens: p.keep_tokens,
+      previews: p.preview_every > 0 ? p.prompts.map(tok) : [], preview_negative: tok(p.negative), preview_every: p.preview_every,
+      preview_w: p.preview_w, preview_h: p.preview_h, preview_steps: p.preview_steps, preview_cfg: p.preview_cfg, preview_seed: 42,
+      preview_sampler: p.preview_sampler, preview_cfg_until: p.preview_cfg_until, preview_nag: p.preview_nag,
+      preview_turbo_lora: p.preview_turbo_lora || undefined,
+    },
+    train: { stage: 'queued', cache: null, losses: [], previews: [], saved: [], epoch: 0, epochs: p.epochs, msAvg: 0 },
+    step: 0, of: p.steps, stepMs: [], stage: 'train', timeline: [],
+  };
+  jobs.set(j.id, j);
+  queue.push(j);
+  return j;
+}
+
+// files the trainer writes live under models/loras: served by path relative to it
+function trainFileUrl(file) {
+  const rel = path.relative(path.join(MODELS, 'loras'), file);
+  return rel.startsWith('..') || path.isAbsolute(rel) ? null : '/api/train/file?f=' + encodeURIComponent(rel.split(path.sep).join('/'));
+}
+function trainView(j) {
+  const t = j.train;
+  // the loss curve, thinned to at most ~600 points
+  const L = t.losses, k = Math.max(1, Math.ceil(L.length / 600));
+  return {
+    stage: t.stage, cache: t.cache, epoch: t.epoch, epochs: t.epochs, msAvg: Math.round(t.msAvg), lr: t.lr, d: t.d,
+    params: t.params, arenaMb: t.arenaMb, last: L.length ? L[L.length - 1] : null,
+    losses: k === 1 ? L : L.filter((_, i) => i % k === 0 || i === L.length - 1),
+    previews: t.previews, saved: t.saved, warnings: t.warnings || [],
+  };
+}
+
+function onTrainEvent(j, ev) {
+  const t = j.train;
+  const send = (extra) => broadcast({ type: 'train', id: j.id, step: j.step, of: j.of, train: trainView(j), ...extra });
+  switch (ev.ev) {
+    case 'loading':
+      t.stage = 'loading';
+      send();
+      break;
+    case 'train':
+      if (ev.stage === 'warn') {  // e.g. images that could not be read and were left out
+        t.warnings = [...(t.warnings || []), String(ev.msg || '')];
+        log(`job ${j.id} ${ev.msg}`);
+        send();
+        break;
+      }
+      t.stage = ev.stage;
+      if (ev.stage === 'cache') t.cache = { done: ev.done, of: ev.of };
+      if (ev.stage === 'ready') { t.params = ev.params; t.arenaMb = ev.arena_mb; }
+      send();
+      break;
+    case 'step':
+      t.stage = 'train';
+      j.step = ev.step; j.of = ev.of;
+      t.epoch = ev.epoch; t.epochs = ev.epochs; t.lr = ev.lr; t.d = ev.d;
+      t.msAvg = t.msAvg ? t.msAvg * 0.9 + ev.ms * 0.1 : ev.ms;
+      t.losses.push([ev.step, +ev.loss.toFixed(5), +ev.avg.toFixed(5)]);
+      send();
+      break;
+    case 'preview': {
+      const url = trainFileUrl(ev.file);
+      if (url) t.previews.push({ step: ev.step, index: ev.index, url, w: ev.w, h: ev.h });
+      send();
+      break;
+    }
+    case 'saved':
+      t.saved.push({ file: path.basename(ev.file), step: ev.step, epoch: ev.epoch });
+      send();
+      break;
+    case 'done':
+    case 'cancelled':
+    case 'error':
+      if (running === j) running = null;
+      engineFamily = 'none';  // the trainer unloads Anima; the next render reloads it
+      t.stage = ev.ev;
+      j.trainReq = null;
+      if (ev.ev === 'done') finishJob(j, 'done', { totalMs: ev.total_ms });
+      else if (ev.ev === 'cancelled') finishJob(j, 'cancelled');
+      else finishJob(j, 'error', { error: ev.msg || 'training failed' });
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-tagging (Datasets tab): the engine runs a WD tagger over the images; each image's tags become its caption
+// (appended to what is there, replacing it, or only where there is none).
+// ---------------------------------------------------------------------------
+function createTagJob(p) {
+  const created = Date.now();
+  const floor = Math.max(0.02, Math.min(p.general, p.character) - 0.001);
+  const j = {
+    id: 'j' + (++jobSeq), group: 'g' + (++groupSeq), index: 0, count: 1, status: 'queued', created, kind: 'tag', family: 'none',
+    params: { kind: 'tag', dir: p.dir, model: p.model, images: p.files.length, mode: p.mode, general: p.general, character: p.character },
+    tagReq: { model: taggers.dirOf(p.model), images: p.files.map(f => path.join(p.dir, f)), floor },
+    tag: { files: p.files, opt: p, failed: [], changed: 0 },
+    step: 0, of: p.files.length, stepMs: [], stage: 'tag', timeline: [],
+  };
+  jobs.set(j.id, j);
+  queue.push(j);
+  return j;
+}
+
+function onTagEvent(j, ev) {
+  const t = j.tag;
+  switch (ev.ev) {
+    case 'loading':
+      j.loading = { what: 'tagger' };
+      emitJob(j);
+      break;
+    case 'tagged':
+    case 'tag_failed': {
+      const file = t.files[ev.index];
+      let caption = null;
+      if (ev.ev === 'tag_failed') t.failed.push(`${file}: ${ev.msg}`);
+      else {
+        try {
+          const o = t.opt;
+          const img = path.join(o.dir, file);
+          const have = datasets.split(datasets.readCap(img));
+          const got = taggers.caption(o.model, ev.probs, o).tags;
+          let next = null;
+          if (o.mode === 'missing') { if (!have.length) next = got; }
+          else if (o.mode === 'replace') {
+            const keep = have.slice(0, o.keep_first), seen = new Set(keep.map(datasets.key));
+            next = [...keep, ...got.filter(x => !seen.has(datasets.key(x)))];
+          } else {
+            const seen = new Set(have.map(datasets.key));
+            next = [...have, ...got.filter(x => !seen.has(datasets.key(x)))];
+          }
+          if (next) {
+            caption = datasets.writeCaption(o.dir, file, next.join(', '));
+            t.changed++;
+          }
+        } catch (e) { t.failed.push(`${file}: ${e.message}`); }
+      }
+      j.step = Math.max(j.step, ev.index + 1);
+      broadcast({ type: 'autotag', id: j.id, dir: t.opt.dir, file, caption, done: j.step, of: j.of, failed: t.failed.length });
+      break;
+    }
+    case 'done':
+    case 'cancelled':
+    case 'error':
+      if (running === j) running = null;
+      j.loading = null;
+      if (ev.ev === 'done') finishJob(j, 'done', { totalMs: ev.total_ms });
+      else if (ev.ev === 'cancelled') finishJob(j, 'cancelled');
+      else finishJob(j, 'error', { error: ev.msg || 'tagging failed' });
+      break;
+  }
+}
+
 function runJob(j) {
   if (engine.state !== 'ready') { running = null; queue.unshift(j); if (j.gpuLease && j.gpuLease !== true) releaseGpu(j.gpuLease); j.gpuLease = null; return; }
   j.status = 'running';
   j.started = Date.now();
   const p = j.params;
   fs.mkdirSync(TMP, { recursive: true });
+  if (j.kind === 'tag') {
+    if (!engine.send({ id: j.id, cmd: 'tag', ...j.tagReq })) { running = null; j.status = 'queued'; queue.unshift(j); return; }
+    log(`job ${j.id} start tagging ${p.images} images in ${p.dir} with ${p.model} (${p.mode}, general ${p.general}, character ${p.character})`);
+    emitJob(j);
+    emitQueue();
+    return;
+  }
+  if (j.kind === 'train') {
+    if (!engine.send({ id: j.id, cmd: 'train', ...j.trainReq })) { running = null; j.status = 'queued'; queue.unshift(j); return; }
+    j.swap = engineFamily !== 'anima';
+    j.train.stage = 'starting';
+    log(`job ${j.id} start training "${p.name}": ${p.images} images × ${p.repeats} repeats, ${p.epochs} epochs, batch ${p.batch_size} (${p.steps} steps), rank ${p.rank}, ${p.optimizer} lr ${p.lr}, ${p.resolution}px`);
+    emitJob(j);
+    emitQueue();
+    return;
+  }
   if (j.kind === 'graph') {
     const eg = j.engineGraph || j.graph;
     if (!Object.keys(eg).length) {
@@ -675,6 +971,8 @@ function onEngineEvent(ev) {
     return;
   }
   if (j.kind === 'graph') return onGraphEvent(j, ev);
+  if (j.kind === 'train') return onTrainEvent(j, ev);
+  if (j.kind === 'tag') return onTagEvent(j, ev);
   switch (ev.ev) {
     case 'loading':
       j.loading = { what: ev.what, progress: ev.progress };
@@ -946,6 +1244,9 @@ const library = createLibrary({
   canRun: (fam) => canRunFamily(fam),
 });
 civitai.on('download', (d) => broadcast({ type: 'download', download: d }));
+const datasets = createDatasets({ ROOT, CONFIG });
+const taggers = createTaggers({ MODELS, onProgress: (d) => broadcast({ type: 'tagger', download: d }) });
+const grab = createGrab({ CONFIG, datasets, broadcast, log });
 civitai.on('installed', (d) => { log(`installed ${d.rel} from CivitAI`); broadcast({ type: 'models' }); });
 hasher.onProgress = (st) => broadcast({ type: 'hashing', hasher: st });
 
@@ -1554,6 +1855,125 @@ async function handle(req, res) {
       return sendJSON(res, 200, { cancelled });
     }
     if (p === '/api/queue' && m === 'GET') return sendJSON(res, 200, queueSnapshot());
+    if (p === '/api/train/dataset' && m === 'GET') {
+      try {
+        const ds = scanDataset(u.searchParams.get('dir'));
+        return sendJSON(res, 200, { dir: ds.dir, images: ds.items.length, captioned: ds.items.filter(i => i.caption).length,
+          items: ds.items.slice(0, 500).map(i => ({ file: i.file, caption: i.caption })) });
+      } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/train' && m === 'POST') {
+      let body;
+      try { body = await readJSON(req); } catch (e) { return sendJSON(res, 400, { error: 'bad json: ' + e.message }); }
+      if (engine.mock) return sendJSON(res, 400, { error: 'training needs the real engine' });
+      if (!(engineInfo && engineInfo.features && engineInfo.features.train)) return sendJSON(res, 400, { error: 'this engine build cannot train (update the engine)' });
+      let params;
+      try { params = validateTrain(body); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      if ([...queue, running].some(q => q && q.kind === 'train')) return sendJSON(res, 400, { error: 'a training run is already queued or running' });
+      let j;
+      try { j = createTrainJob(params); } catch (e) { return sendJSON(res, 500, { error: 'tokenizing the captions failed: ' + e.message }); }
+      emitJob(j);
+      emitQueue();
+      pump();
+      return sendJSON(res, 200, { id: j.id, images: params.ds.items.length, steps: params.steps, epochs: params.epochs, out: j.params.out });
+    }
+    // ---- datasets (Datasets tab)
+    if (p.startsWith('/api/datasets') || p.startsWith('/api/taggers') || p.startsWith('/api/booru')) {
+      const origin = req.headers.origin;
+      if (m !== 'GET' && m !== 'HEAD' && origin !== undefined) {  // another website must not edit datasets through the browser
+        let host = null;
+        try { host = new URL(origin).host; } catch (_) { }
+        if (host !== req.headers.host) return sendJSON(res, 403, { error: 'cross-origin request refused' });
+      }
+      const q = (k) => u.searchParams.get(k);
+      try {
+        if (p === '/api/datasets' && m === 'GET') return sendJSON(res, 200, datasets.list());
+        // ---- BooruGrab
+        if (p === '/api/booru/settings' && m === 'GET') return sendJSON(res, 200, grab.settings(isLoopback(req)));
+        if (p === '/api/booru/status' && m === 'GET') return sendJSON(res, 200, grab.status());
+        if (p === '/api/booru/search' && m === 'GET') {
+          try { return sendJSON(res, 200, await grab.search(q('site'), q('q'), Number(q('page')) || 1)); }
+          catch (e) { return sendJSON(res, 502, { error: e.message }); }
+        }
+        if (p === '/api/booru/img' && m === 'GET') {
+          let r;
+          try { r = await grab.image(q('site'), q('url')); } catch (e) { return sendJSON(res, 502, { error: e.message }); }
+          res.writeHead(200, { 'Content-Type': r.type, 'Content-Length': r.buffer.length, 'Cache-Control': 'private, max-age=3600' });
+          return res.end(r.buffer);
+        }
+        if (p === '/api/datasets/items' && m === 'GET') return sendJSON(res, 200, datasets.items(q('dir')));
+        if (p === '/api/datasets/image' && (m === 'GET' || m === 'HEAD')) {
+          const f = datasets.fileIn(q('dir'), q('f'));
+          if (!datasets.IMG_RE.test(f)) return sendJSON(res, 404, { error: 'not found' });
+          return serveFile(req, res, f, { 'Cache-Control': 'no-cache' });
+        }
+        if (p === '/api/datasets/thumb' && (m === 'GET' || m === 'HEAD')) {
+          const t = datasets.thumbPath(q('dir'), q('f'));
+          if (!fs.existsSync(t)) return sendJSON(res, 404, { error: 'no thumbnail yet' });
+          return serveFile(req, res, t, { 'Cache-Control': 'no-cache' });
+        }
+        if (p === '/api/datasets/thumb' && m === 'POST') {
+          datasets.putThumb(q('dir'), q('f'), await readRaw(req, 400 * 1024));
+          return sendJSON(res, 200, { ok: true });
+        }
+        if (m === 'POST') {
+          const b = await readJSON(req);
+          if (p === '/api/datasets/create') return sendJSON(res, 200, datasets.create(b.name));
+          if (p === '/api/booru/settings') { grab.update(b); return sendJSON(res, 200, grab.settings(isLoopback(req))); }
+          if (p === '/api/booru/import') {
+            const why = manageDenied(req);  // reads a file on this PC
+            if (why) return sendJSON(res, 403, { error: why });
+            const r = grab.importBooruGrab();
+            log(`imported BooruGrab settings: ${r.sites} sites`);
+            return sendJSON(res, 200, { ...r, settings: grab.settings(isLoopback(req)) });
+          }
+          if (p === '/api/booru/resolve') {
+            try { return sendJSON(res, 200, await grab.resolve(b.site, b.post || {})); } catch (e) { return sendJSON(res, 502, { error: e.message }); }
+          }
+          if (p === '/api/booru/download') {
+            const n = grab.enqueue(b.dir, Array.isArray(b.posts) ? b.posts.slice(0, 2000) : []);
+            return sendJSON(res, 200, { queued: n, status: grab.status() });
+          }
+          if (p === '/api/booru/cancel') { grab.cancel(); return sendJSON(res, 200, grab.status()); }
+          if (p === '/api/datasets/open') {
+            const why = manageDenied(req);  // a new folder on this PC: only from the PC itself
+            if (why) return sendJSON(res, 403, { error: why });
+            return sendJSON(res, 200, datasets.open(b.dir));
+          }
+          if (p === '/api/datasets/forget') { datasets.forget(b.dir); return sendJSON(res, 200, { ok: true }); }
+          if (p === '/api/datasets/caption') return sendJSON(res, 200, { caption: datasets.writeCaption(b.dir, b.file, b.caption) });
+          if (p === '/api/datasets/bulk') return sendJSON(res, 200, datasets.bulk(b.dir, b.files, b.op, b.tags, b.to));
+          if (p === '/api/datasets/remove') return sendJSON(res, 200, datasets.remove(b.dir, b.files));
+          if (p === '/api/taggers/download') { await taggers.download(String(b.id || '')); return sendJSON(res, 200, { ok: true }); }
+          if (p === '/api/datasets/autotag') {
+            if (!(engineInfo && engineInfo.features && engineInfo.features.tag)) return sendJSON(res, 400, { error: 'this engine build cannot tag images (update the engine)' });
+            const dir = datasets.allowed(b.dir);
+            const model = String(b.model || '');
+            if (!taggers.installed(model)) return sendJSON(res, 400, { error: 'download the tagger first' });
+            const all = datasets.items(dir).items.map(i => i.file);
+            const files = Array.isArray(b.files) && b.files.length ? all.filter(f => b.files.includes(f)) : all;
+            if (!files.length) return sendJSON(res, 400, { error: 'no images to tag' });
+            const j = createTagJob({
+              dir, files, model, mode: ['append', 'replace', 'missing'].includes(b.mode) ? b.mode : 'append',
+              general: num(b.general, 0.35, 0.05, 0.99), character: num(b.character, 0.85, 0.05, 0.99),
+              exclude: datasets.split(b.exclude), underscores: !!b.underscores, rating: !!b.rating, keep_first: Math.round(num(b.keep_first, 0, 0, 20)),
+            });
+            emitJob(j);
+            emitQueue();
+            pump();
+            return sendJSON(res, 200, { id: j.id, images: files.length });
+          }
+        }
+        if (p === '/api/taggers' && m === 'GET') return sendJSON(res, 200, { taggers: taggers.list() });
+        return sendJSON(res, 404, { error: 'not found' });
+      } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/train/file' && (m === 'GET' || m === 'HEAD')) {
+      const base = path.join(MODELS, 'loras');
+      const f = path.resolve(base, String(u.searchParams.get('f') || ''));
+      if (!f.startsWith(base + path.sep) || !/\.png$/i.test(f)) return sendJSON(res, 404, { error: 'not found' });
+      return serveFile(req, res, f, { 'Cache-Control': 'no-cache' });
+    }
     if (p === '/api/engine' && m === 'GET') return sendJSON(res, 200, engineStatus());
     if (p === '/api/engine/park' && m === 'POST') {
       if (!isLoopback(req)) return sendJSON(res, 403, { error: 'only apps on this PC can park the engine' });

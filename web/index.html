@@ -52,6 +52,8 @@
   <button type="button" role="tab" data-tab="img2img" data-mode="img2img" aria-selected="false">img2img</button>
   <button type="button" role="tab" data-tab="extras" data-mode="extras" aria-selected="false">Extras</button>
   <button type="button" role="tab" data-tab="pnginfo" data-mode="pnginfo" aria-selected="false">PNG Info</button>
+  <button type="button" role="tab" data-tab="datasets" data-mode="datasets" aria-selected="false">Datasets</button>
+  <button type="button" role="tab" data-tab="train" data-mode="train" aria-selected="false">Train</button>
   <button type="button" role="tab" data-tab="nodes" data-mode="nodes" aria-selected="false">Nodes</button>
   <button type="button" role="tab" data-tab="settings" data-mode="settings" aria-selected="false">Settings</button>
 </nav>
@@ -332,6 +334,250 @@
   </section>
 
   <!-- ======================================================= Extras -->
+  <!-- ======================================================= Datasets (images + captions, booru grab, auto-tag) -->
+  <section class="a-panel" id="dsPanel" data-tab-panel="datasets" hidden>
+    <div class="a-block ds-top">
+      <div class="a-field ds-pick"><label for="dsPick">Dataset</label><select id="dsPick"></select></div>
+      <button type="button" class="a-btn" id="dsNew">New…</button>
+      <div class="ds-open">
+        <input type="text" id="dsOpenPath" spellcheck="false" placeholder="or open a folder, e.g. C:\Users\you\BooruGrab\downloads\safebooru">
+        <button type="button" class="a-btn" id="dsOpen">Open</button>
+      </div>
+      <div class="a-radio ds-views" role="radiogroup">
+        <button type="button" role="radio" data-v="images" aria-checked="true">Images &amp; tags</button>
+        <button type="button" role="radio" data-v="grab" aria-checked="false">Grab from boorus</button>
+      </div>
+      <span class="ds-sum" id="dsSum"></span>
+      <button type="button" class="a-btn primary" id="dsTrain" disabled>Train on this</button>
+    </div>
+
+    <div class="ds-wrap" id="dsImages">
+      <div class="ds-main">
+        <div class="a-block ds-bar">
+          <input type="search" id="dsFilter" spellcheck="false" placeholder="Filter by tag (comma = all of them; -tag excludes)">
+          <select id="dsShow"><option value="all">All images</option><option value="untagged">Untagged only</option><option value="selected">Selected only</option></select>
+          <button type="button" class="a-btn sm" id="dsSelAll">Select all</button>
+          <button type="button" class="a-btn sm" id="dsSelNone">Select none</button>
+          <span class="ds-count" id="dsCount"></span>
+        </div>
+        <div class="ds-grid" id="dsGrid"></div>
+        <div class="ds-empty" id="dsEmpty" hidden></div>
+      </div>
+      <aside class="ds-side">
+        <div class="a-block ds-edit" id="dsEdit">
+          <div class="ds-edit-none" id="dsEditNone">Click an image to edit its tags. Ctrl-click and Shift-click select several.</div>
+          <div id="dsEditOne" hidden>
+            <img id="dsEditImg" alt="">
+            <div class="ds-edit-name" id="dsEditName"></div>
+            <div class="ds-chips" id="dsChips"></div>
+            <div class="ds-add">
+              <input type="text" id="dsAddTag" list="dsTagList" spellcheck="false" placeholder="add a tag (Enter)">
+              <button type="button" class="a-btn sm" id="dsRawBtn" title="Edit the caption as text">Text</button>
+            </div>
+            <textarea id="dsRaw" rows="4" spellcheck="false" hidden></textarea>
+          </div>
+          <div id="dsEditMany" hidden></div>
+          <datalist id="dsTagList"></datalist>
+        </div>
+
+        <div class="a-block">
+          <div class="t-head">Bulk edit <span class="ds-scope" id="dsScope"></span></div>
+          <div class="ds-op"><input type="text" id="dsTrig" spellcheck="false" placeholder="trigger / activation tag(s)"><button type="button" class="a-btn sm" id="dsTrigGo" title="Put these tags first in every caption (once)">Add to front</button></div>
+          <div class="ds-op"><input type="text" id="dsAddMany" list="dsTagList" spellcheck="false" placeholder="tags to add"><button type="button" class="a-btn sm" id="dsAddGo">Add</button></div>
+          <div class="ds-op"><input type="text" id="dsDelMany" list="dsTagList" spellcheck="false" placeholder="tags to remove"><button type="button" class="a-btn sm" id="dsDelGo">Remove</button></div>
+          <div class="ds-op"><input type="text" id="dsRepFrom" list="dsTagList" spellcheck="false" placeholder="replace tag"><input type="text" id="dsRepTo" spellcheck="false" placeholder="with"><button type="button" class="a-btn sm" id="dsRepGo">Replace</button></div>
+          <button type="button" class="a-btn sm danger" id="dsRemove" title="Moves them (and their captions) into the dataset's _removed folder">Remove selected images from the dataset</button>
+        </div>
+
+        <div class="a-block">
+          <div class="t-head">Auto-tag <span class="ds-scope" id="dsTagScope"></span></div>
+          <div class="a-row">
+            <div class="a-field"><label for="dsTagger">Tagger</label><select id="dsTagger"></select></div>
+          </div>
+          <div class="ds-tagger-dl" id="dsTaggerDl"></div>
+          <div class="a-row">
+            <div class="a-field"><label for="dsGen">General ≥</label><input type="number" id="dsGen" min="0.05" max="0.99" step="0.01"></div>
+            <div class="a-field"><label for="dsChar">Character ≥</label><input type="number" id="dsChar" min="0.05" max="0.99" step="0.01"></div>
+            <div class="a-field"><label for="dsMode">Captions</label><select id="dsMode">
+              <option value="append">Add new tags</option><option value="replace">Replace</option><option value="missing">Untagged images only</option></select></div>
+          </div>
+          <div class="a-row ds-keep" id="dsKeepRow"><div class="a-field"><label for="dsKeep">Keep the first N tags (e.g. your trigger)</label><input type="number" id="dsKeep" min="0" max="20" step="1"></div></div>
+          <input type="text" id="dsExclude" spellcheck="false" placeholder="never add these tags (comma separated)">
+          <div class="a-row ds-checks">
+            <label class="a-check"><input type="checkbox" id="dsRating"> Rating tag</label>
+            <label class="a-check"><input type="checkbox" id="dsUnders"> Keep underscores</label>
+          </div>
+          <button type="button" class="a-btn primary ds-tag-go" id="dsTagGo">Tag images</button>
+          <div class="a-hint" id="dsTagStatus"></div>
+        </div>
+
+        <details class="a-block ds-tags-block" open>
+          <summary class="t-head">Tags in this dataset</summary>
+          <input type="search" id="dsTagFind" spellcheck="false" placeholder="find a tag">
+          <div class="ds-tags" id="dsTags"></div>
+        </details>
+      </aside>
+    </div>
+
+    <div class="ds-wrap g-wrap" id="dsGrab" hidden>
+      <div class="ds-main">
+        <div class="a-block g-top">
+          <div class="g-row">
+            <input type="search" id="gQuery" spellcheck="false" placeholder="tags, e.g. amy_rose solo   (Enter searches)">
+            <button type="button" class="a-btn primary" id="gGo">Search</button>
+            <button type="button" class="a-btn" id="gSetBtn">Settings…</button>
+          </div>
+          <div class="g-row g-toggles">
+            <span class="g-lbl">Sites</span><span id="gSites" class="g-sites"></span>
+            <span class="g-lbl">Rating</span><span id="gRatings" class="g-ratings"></span>
+          </div>
+          <div class="g-notices" id="gNotices" hidden></div>
+        </div>
+        <div class="ds-grid g-grid" id="gGrid"></div>
+        <div class="a-block g-bottom">
+          <span id="gStatus">0 results</span>
+          <button type="button" class="a-btn sm" id="gSelAll">Select all</button>
+          <button type="button" class="a-btn sm primary" id="gDlSel" disabled>Download selected</button>
+          <button type="button" class="a-btn sm" id="gMore" disabled>Load more</button>
+          <span class="a-spacer"></span>
+          <span class="g-dl" id="gDlStatus"></span>
+          <div class="a-vprog g-bar" id="gBar" hidden><div class="a-vprog-bar"><i id="gBarFill"></i></div></div>
+          <button type="button" class="a-btn sm" id="gCancel" hidden>Cancel</button>
+        </div>
+      </div>
+      <aside class="ds-side">
+        <div class="a-block g-pv">
+          <div class="g-pv-title" id="gPvTitle">Click a thumbnail to preview it</div>
+          <div class="g-pv-img"><img id="gPvImg" alt=""></div>
+          <div class="g-pv-btns">
+            <button type="button" class="a-btn sm primary" id="gPvDl" disabled>Download</button>
+            <a class="a-btn sm" id="gPvOpen" target="_blank" rel="noopener noreferrer">Open on site</a>
+            <button type="button" class="a-btn sm" id="gPvCopy" disabled>Copy tags</button>
+          </div>
+          <div class="g-pv-tags" id="gPvTags"></div>
+        </div>
+      </aside>
+    </div>
+
+    <dialog class="g-dialog" id="gSettings">
+      <form method="dialog" class="g-set">
+        <div class="t-head">Booru settings</div>
+        <div class="a-row">
+          <div class="a-field"><label for="gsFmt">Tag file format</label><select id="gsFmt"><option value="spaces">long hair, red eyes (training captions)</option><option value="raw">long_hair red_eyes (raw)</option></select></div>
+          <div class="a-field"><label for="gsLimit">Posts per site per page</label><input type="number" id="gsLimit" min="5" max="200" step="1"></div>
+          <div class="a-field"><label for="gsConc">Parallel downloads</label><input type="number" id="gsConc" min="1" max="8" step="1"></div>
+        </div>
+        <div class="a-row ds-checks">
+          <label class="a-check"><input type="checkbox" id="gsSkip"> Skip files already downloaded</label>
+          <label class="a-check"><input type="checkbox" id="gsMeta"> Meta tags in the .txt (highres, absurdres, ...)</label>
+          <label class="a-check"><input type="checkbox" id="gsJson"> Also save a .json with the post details</label>
+        </div>
+        <div class="a-field"><label for="gsBlack">Blacklist (tags to hide)</label><input type="text" id="gsBlack" spellcheck="false"></div>
+        <div class="t-head g-sites-head">Sites <button type="button" class="a-btn sm" id="gsAdd">Add site</button> <button type="button" class="a-btn sm" id="gsImport" title="Read BooruGrab's settings.json (sites, API keys, blacklist)">Import from BooruGrab</button></div>
+        <div class="g-site-table"><table><thead><tr><th>On</th><th>Name</th><th>Engine</th><th>URL</th><th>User / login / user ID</th><th>API key</th><th></th></tr></thead><tbody id="gsSites"></tbody></table></div>
+        <div class="a-hint" id="gsEngines"></div>
+        <div class="g-set-btns"><button type="button" class="a-btn" id="gsCancel">Cancel</button><button type="button" class="a-btn primary" id="gsSave">Save</button></div>
+      </form>
+    </dialog>
+  </section>
+
+  <!-- ======================================================= Train (Anima LoRA) -->
+  <section class="a-panel" id="trainPanel" data-tab-panel="train" hidden>
+    <div class="a-cols">
+      <div class="a-left">
+        <div class="a-block">
+          <div class="t-head">Dataset</div>
+          <div class="t-line">
+            <input type="text" id="tDir" spellcheck="false" placeholder="Folder of images with .txt captions, e.g. C:\Users\you\dataset">
+            <button type="button" class="a-btn" id="tScan">Scan</button>
+          </div>
+          <div class="a-hint" id="tDs">Images (png, jpg, webp) with a .txt caption of the same name; images without one train on the trigger word alone.</div>
+        </div>
+        <div class="a-block">
+          <div class="t-head">LoRA</div>
+          <div class="a-row">
+            <div class="a-field"><label for="tModel">Train on</label><select id="tModel" title="The Anima checkpoint the LoRA learns against. Render with the same one for the closest match."></select></div>
+            <div class="a-field"><label for="tPreset">Preset</label><select id="tPreset">
+              <option value="character">Character</option>
+              <option value="character_quick">Character, quick test</option>
+              <option value="style">Style</option>
+              <option value="style_quick">Style, quick test</option>
+              <option value="custom">Custom</option>
+            </select></div>
+          </div>
+          <div class="a-hint t-preset-hint" id="tPresetHint"></div>
+          <div class="a-row">
+            <div class="a-field"><label for="tName">Name</label><input type="text" id="tName" spellcheck="false" placeholder="my_lora"></div>
+            <div class="a-field"><label for="tTrigger">Trigger word</label><input type="text" id="tTrigger" spellcheck="false" placeholder="optional, put in front of every caption"></div>
+          </div>
+          <div class="a-row">
+            <div class="a-field"><label for="tRepeats">Repeats</label><input type="number" id="tRepeats" min="1" max="1000" step="1" title="How many times each image is shown per epoch (sd-scripts' num_repeats)"></div>
+            <div class="a-field"><label for="tEpochs">Epochs</label><input type="number" id="tEpochs" min="1" max="1000" step="1"></div>
+          </div>
+          <div class="a-row">
+            <div class="a-field"><label for="tRank">Rank</label><select id="tRank"><option>8</option><option>16</option><option>32</option><option>64</option></select></div>
+            <div class="a-field"><label for="tRes">Resolution</label><select id="tRes"><option value="512">512 (fast)</option><option value="640">640</option><option value="768">768</option></select></div>
+          </div>
+          <div class="a-row">
+            <div class="a-field"><label for="tOpt">Optimizer</label><select id="tOpt"><option value="prodigy">Prodigy (finds its own learning rate)</option><option value="adamw">AdamW</option></select></div>
+            <div class="a-field"><label for="tLr">Learning rate</label><input type="number" id="tLr" min="0" step="any"></div>
+            <div class="a-field"><label for="tSaveEvery">Save every N epochs</label><input type="number" id="tSaveEvery" min="0" step="1" title="0: only the final LoRA"></div>
+          </div>
+        </div>
+        <details class="a-block t-adv" id="tAdv">
+          <summary class="t-head">Captions, augmentation and noise</summary>
+          <div class="a-row">
+            <label class="t-check" title="Shuffle the comma-separated tags every time an image is shown (sd-scripts' shuffle_caption)"><input type="checkbox" id="tShuffle"> Shuffle tags</label>
+            <div class="a-field"><label for="tKeep">Keep first N tags</label><input type="number" id="tKeep" min="0" max="32" step="1" title="These stay in front while the rest shuffle; the trigger word counts as one"></div>
+            <div class="a-field"><label for="tDrop">Caption dropout %</label><input type="number" id="tDrop" min="0" max="90" step="1" title="How often an image trains with an empty caption"></div>
+          </div>
+          <div class="a-row">
+            <label class="t-check" title="Train on mirrored copies half the time (avoid for one-sided designs, text, logos)"><input type="checkbox" id="tFlip"> Flip images</label>
+            <div class="a-field"><label for="tBatch">Batch size</label><input type="number" id="tBatch" min="1" max="16" step="1" title="Images averaged into each optimizer step"></div>
+            <div class="a-field"><label for="tWarmup">Warmup steps</label><input type="number" id="tWarmup" min="0" step="1" title="Learning rate ramps up over these steps"></div>
+          </div>
+          <div class="a-row">
+            <div class="a-field"><label for="tTs">Timesteps</label><select id="tTs"><option value="sigmoid">Sigmoid</option><option value="shift">Shift</option><option value="uniform">Uniform</option></select></div>
+            <div class="a-field" id="tSigF"><label for="tSig">Sigmoid scale</label><input type="number" id="tSig" min="0.1" max="5" step="0.1" title="Higher: more very noisy and very clean steps; lower: more mid-noise steps"></div>
+            <div class="a-field" id="tShiftF"><label for="tShift">Shift</label><input type="number" id="tShift" min="0.1" max="10" step="0.1" title="Above 1: more noisy steps (composition); below 1: more clean steps (detail)"></div>
+            <div class="a-field"><label for="tNoiseOff">Noise offset</label><input type="number" id="tNoiseOff" min="0" max="0.5" step="0.01"></div>
+          </div>
+        </details>
+        <div class="a-block">
+          <div class="t-head">Previews</div>
+          <div class="a-row">
+            <label class="t-check" title="Render previews the way txt2img's Turbo button does: the turbo LoRA at 1.0, 8 steps, CFG 1, Euler, the negative prompt through NAG. Off: Base (20 steps, CFG 4.5, DPM++ 2M)."><input type="checkbox" id="tPvTurbo"> Turbo</label>
+            <div class="a-field"><label for="tPvEvery">Every N steps</label><input type="number" id="tPvEvery" min="0" step="1" title="0: no previews"></div>
+            <div class="a-field"><label for="tPvSize">Size</label><select id="tPvSize"><option value="512x768">512×768</option><option value="768x512">768×512</option><option value="640x640">640×640</option><option value="512x512">512×512</option></select></div>
+            <div class="a-field"><label for="tPvFrom">Use the tags of</label><select id="tPvFrom"><option value="">pick an image…</option></select></div>
+          </div>
+          <div class="a-tb"><textarea id="tPvPrompt" rows="3" spellcheck="false" placeholder="Preview prompts, one per line (up to 4). Tip: add one with a subject that isn't in your images, to see whether the LoRA carries over"></textarea></div>
+          <div class="a-tb"><textarea id="tPvNeg" rows="1" spellcheck="false" placeholder="Negative prompt"></textarea></div>
+        </div>
+        <div class="a-hint" id="tPlan"></div>
+        <div class="t-go">
+          <button type="button" class="a-generate a-wide" id="tGo">Start training</button>
+          <button type="button" class="a-btn danger" id="tCancel" hidden>Stop (saves a checkpoint)</button>
+        </div>
+      </div>
+      <div class="a-right">
+        <div class="a-block">
+          <div class="t-status" id="tStatus">No training yet.</div>
+          <div class="a-vprog t-prog" id="tProg" hidden><div class="a-vprog-bar"><i id="tBar"></i></div><span id="tStage"></span></div>
+          <canvas id="tLoss" class="t-loss" width="640" height="160" hidden></canvas>
+        </div>
+        <div class="a-block" id="tPvBlock" hidden>
+          <div class="t-head">Previews</div>
+          <div class="t-previews" id="tPreviews"></div>
+        </div>
+        <div class="a-block" id="tSavedBlock" hidden>
+          <div class="t-head">Saved</div>
+          <div class="t-saved" id="tSaved"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="a-panel" id="extrasPanel" data-tab-panel="extras" hidden>
     <div class="a-cols">
       <div class="a-left">
@@ -476,6 +722,9 @@
 <script src="gen.js"></script>
 <script src="xnet.js"></script>
 <script src="tabs.js"></script>
+<script src="train.js"></script>
+<script src="datasets.js"></script>
+<script src="grab.js"></script>
 <script src="nodes.js"></script>
 <script src="extensions.js"></script>
 </body>
